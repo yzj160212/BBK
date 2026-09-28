@@ -3,13 +3,16 @@
 # deploy-relay.sh — 中转机（入口端）一键部署
 #
 #   = 开荒（vps.sh：SSH 加固 / fail2ban / UFW / 日志优化）
-#   + 纯 TCP 转发（iptables DNAT），把客户端流量原样送到落地机的 snell-server
+#   + 纯 TCP/UDP 转发（iptables DNAT），把客户端流量原样送到落地机的 snell-server
 #
 # 架构：Surge --Snell--> 中转机(纯转发，不解密) --> 落地机(snell-server) --> Internet
 #
 # ⚠️ 本脚本**不安装任何代理软件**，中转机只是一个"透明管道"：
 #    Snell 加密是端到端（客户端 <-> 落地机）的，中转机全程看不到内容，
 #    因此没有任何加解密开销，延迟最低。
+#
+# TCP 和 UDP 都转发。UDP 是给 QUIC（HTTP/3）用的 —— Snell v5 的 QUIC Proxy Mode
+# 走的是 UDP over UDP，只转发 TCP 会让这类流量失败并回退到 TCP，每次连接慢一拍。
 #
 # 用法：
 #   bash deploy-relay.sh --landing-ip <落地机公网IP>
@@ -65,10 +68,12 @@ hr()   { printf '%s\n' "--------------------------------------------------------
 # ============================ 用法 ============================
 usage() {
   cat <<'EOF'
-deploy-relay.sh v1.0.0 — 中转机（入口端）一键部署（开荒 + 纯 TCP 转发）
+deploy-relay.sh v1.0.0 — 中转机（入口端）一键部署（开荒 + 纯 TCP/UDP 转发）
 
 中转机不安装任何代理软件，只做 iptables DNAT 转发：
 客户端连中转机的端口，流量被原样送到落地机的 snell-server，中转机不解密。
+TCP 和 UDP 都转发 —— UDP 是为了让 QUIC（HTTP/3）能正常走 UDP-over-UDP，
+不然这类流量会失败并回退到 TCP，每次连接都慢一拍。
 
 转发参数：
   --landing-ip <IP>      落地机公网 IP（必填）
@@ -399,6 +404,13 @@ allow_ufw_forward() {
   fi
 }
 
+# 判断某协议的 DNAT 规则是否已生效（$1 = tcp 或 udp）
+dnat_rule_present() {
+  local proto="$1"
+  iptables -t nat -S PREROUTING 2>/dev/null \
+    | grep -q -- "-p ${proto} --dport ${LISTEN_PORT} -j DNAT" || return 1
+}
+
 # 把 DNAT / MASQUERADE 规则写进 /etc/ufw/before.rules。
 # 为什么写这里而不是直接 iptables：`ufw reload` 会清空并重建整张表，
 # 直接加的规则会丢；写在 before.rules 里才能扛住 reload 和重启。
@@ -423,14 +435,16 @@ ${MARK_BEGIN}
 :PREROUTING ACCEPT [0:0]
 :POSTROUTING ACCEPT [0:0]
 -A PREROUTING -p tcp --dport ${LISTEN_PORT} -j DNAT --to-destination ${LANDING_IP}:${LANDING_PORT}
+-A PREROUTING -p udp --dport ${LISTEN_PORT} -j DNAT --to-destination ${LANDING_IP}:${LANDING_PORT}
 -A POSTROUTING -p tcp -d ${LANDING_IP} --dport ${LANDING_PORT} -j MASQUERADE
+-A POSTROUTING -p udp -d ${LANDING_IP} --dport ${LANDING_PORT} -j MASQUERADE
 COMMIT
 ${MARK_END}
 EOF
 
   cat "$blk" "$tmp" > "$UFW_BEFORE"
   rm -f "$tmp" "$blk"
-  log "已写入转发规则：${LISTEN_PORT}/tcp  ->  ${LANDING_IP}:${LANDING_PORT}"
+  log "已写入转发规则：${LISTEN_PORT}（TCP + UDP）  ->  ${LANDING_IP}:${LANDING_PORT}"
 }
 
 reload_ufw() {
@@ -439,12 +453,10 @@ reload_ufw() {
     systemctl restart ufw >/dev/null 2>&1 || true
   fi
   sleep 1
-  local rule=""
-  rule="$(iptables -t nat -S PREROUTING 2>/dev/null | grep -m1 -- "--dport ${LISTEN_PORT} " || true)"
-  if [[ -n "$rule" ]]; then
-    log "转发规则已生效"
+  if dnat_rule_present tcp && dnat_rule_present udp; then
+    log "转发规则已生效（TCP + UDP）"
   else
-    err "转发规则没有生效，当前 nat PREROUTING："
+    err "转发规则没有完整生效，当前 nat PREROUTING："
     iptables -t nat -S PREROUTING 2>/dev/null | sed 's/^/    /' || true
     die "请把上面内容发给开发者。"
   fi
@@ -495,7 +507,7 @@ main() {
     info "dry-run：以下动作不会真正执行"
     info "  开启 net.ipv4.ip_forward"
     info "  设置 ${UFW_DEFAULT} 的 DEFAULT_FORWARD_POLICY=ACCEPT"
-    info "  在 ${UFW_BEFORE} 写入 DNAT：${LISTEN_PORT}/tcp -> ${LANDING_IP}:${LANDING_PORT}"
+    info "  在 ${UFW_BEFORE} 写入 DNAT：${LISTEN_PORT}（TCP + UDP）-> ${LANDING_IP}:${LANDING_PORT}"
     info "  ufw reload 并校验规则"
     echo
     log "dry-run 完成，未改动系统"
@@ -531,10 +543,13 @@ main() {
   fi
 
   printf '  %-40s' "3. DNAT 规则"
-  if iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- "--dport ${LISTEN_PORT} "; then
-    printf '%s已写入%s\n' "$C_G" "$C_0"
+  local r_tcp="缺" r_udp="缺"
+  if dnat_rule_present tcp; then r_tcp="有"; fi
+  if dnat_rule_present udp; then r_udp="有"; fi
+  if [[ "$r_tcp" == "有" && "$r_udp" == "有" ]]; then
+    printf '%sTCP + UDP 都已写入%s\n' "$C_G" "$C_0"
   else
-    printf '%s缺失%s\n' "$C_R" "$C_0"
+    printf '%sTCP:%s  UDP:%s%s\n' "$C_R" "$r_tcp" "$r_udp" "$C_0"
   fi
 
   selftest_forward

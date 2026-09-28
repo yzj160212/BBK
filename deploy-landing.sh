@@ -7,6 +7,9 @@
 #
 # 架构：Surge --Snell--> 中转机(纯转发，不解密) --> 落地机(snell-server) --> Internet
 #
+# 防火墙会同时放行 TCP 和 UDP：UDP 是给 Snell v5 的 QUIC Proxy Mode（HTTP/3）用的。
+# 用 --relay-ip 指定中转机 IP 后，这两个端口只对中转机开放，落地机对外完全隐形。
+#
 # 用法：
 #   bash deploy-landing.sh --relay-ip <中转机公网IP>
 #   bash deploy-landing.sh --relay-ip <中转机IP> --snell-port 6160 --ssh-port 22222
@@ -68,9 +71,12 @@ deploy-landing.sh v1.0.0 — 落地机（出口端）一键部署（开荒 + Sne
 Snell 参数：
   --relay-ip <IP>        中转机公网 IP。填了就只允许它访问本机 Snell 端口，
                          落地机对外完全隐形；同时客户端配置会用它作为服务器地址。
-  --snell-port <端口>    snell-server 监听端口（默认 6160）
+  --snell-port <端口>    snell-server 监听端口（默认 6160，TCP 和 UDP 都监听）
   --psk <密钥>           预共享密钥；不填自动生成（推荐自动生成）
   --force                已部署过时强制重做（会重新生成 PSK！客户端要同步改）
+
+说明：防火墙会同时放行该端口的 TCP 和 UDP —— UDP 是给 Snell v5 的
+      QUIC Proxy Mode（HTTP/3）用的，只放 TCP 会让这类流量回退，每次连接慢一拍。
 
 开荒参数（第 1 步，会改动 SSH 登录方式）：
   --ssh-port <端口>      开荒后 SSH 使用的端口（默认随机挑 20000-60000）
@@ -176,6 +182,22 @@ listen_lines() {
 port_in_use() {
   local port="$1"
   [[ -n "$(listen_lines | awk -v p="$port" '$4 ~ "[.:]"p"$"{print; exit}')" ]]
+}
+
+# UDP 监听套接字。注意 UDP 的 State 列是 UNCONN 而不是 LISTEN，
+# 所以不能复用 listen_lines()（那个按 $1=="LISTEN" 过滤）。
+udp_listen_lines() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -lunp 2>/dev/null | awk 'NR>1' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ulnp 2>/dev/null | awk '$1 ~ /^udp/' || true
+  fi
+}
+
+# 判断某 UDP 端口是否在监听（用于确认 Snell v5 的 QUIC 通道可用）
+udp_port_listening() {
+  local port="$1"
+  [[ -n "$(udp_listen_lines | awk -v p="$port" '$4 ~ "[.:]"p"$"{print; exit}')" ]]
 }
 
 pick_ssh_port() {
@@ -476,12 +498,15 @@ EOF
 
 configure_firewall() {
   command -v ufw >/dev/null 2>&1 || { warn "没有 ufw，跳过防火墙配置"; return 0; }
+  # TCP + UDP 都要放行：UDP 是给 Snell v5 的 QUIC Proxy Mode（HTTP/3）用的
   if [[ -n "$RELAY_IP" ]]; then
     ufw allow from "$RELAY_IP" to any port "$SNELL_PORT" proto tcp >/dev/null 2>&1 || true
-    log "防火墙：只放行中转机 ${RELAY_IP} 访问 ${SNELL_PORT}/tcp（落地机对外隐形）"
+    ufw allow from "$RELAY_IP" to any port "$SNELL_PORT" proto udp >/dev/null 2>&1 || true
+    log "防火墙：只放行中转机 ${RELAY_IP} 访问 ${SNELL_PORT}（TCP + UDP），落地机对外隐形"
   else
     ufw allow "${SNELL_PORT}/tcp" >/dev/null 2>&1 || true
-    warn "未指定 --relay-ip，${SNELL_PORT}/tcp 对全网开放。"
+    ufw allow "${SNELL_PORT}/udp" >/dev/null 2>&1 || true
+    warn "未指定 --relay-ip，${SNELL_PORT}（TCP + UDP）对全网开放。"
     warn "建议加上 --relay-ip <中转机IP> 重跑，让落地机对外隐形。"
   fi
 }
@@ -541,7 +566,7 @@ main() {
     info "  下载并安装 snell-server ${SNELL_VER}（架构 $(snell_arch)）"
     info "  写入 ${SNELL_CONF}（listen 0.0.0.0:${SNELL_PORT}）"
     info "  创建 systemd 服务 snell-server"
-    info "  防火墙放行 ${SNELL_PORT}/tcp${RELAY_IP:+（仅限 ${RELAY_IP}）}"
+    info "  防火墙放行 ${SNELL_PORT}（TCP + UDP）${RELAY_IP:+（仅限 ${RELAY_IP}）}"
     info "  开启 BBR"
     echo
     log "dry-run 完成，未改动系统"
@@ -564,12 +589,17 @@ main() {
   printf '  %-40s' "1. snell-server 服务状态"
   if systemctl is-active --quiet snell-server; then printf '%sactive%s\n' "$C_G" "$C_0"; else printf '%s未运行%s\n' "$C_R" "$C_0"; fi
 
-  printf '  %-40s' "2. 监听端口"
-  local listen=""
-  listen="$(listen_lines | awk -v p="$SNELL_PORT" '$4 ~ "[.:]"p"$"' || true)"
-  if [[ -n "$listen" ]]; then printf '%s监听中%s\n' "$C_G" "$C_0"; else printf '%s未监听%s\n' "$C_R" "$C_0"; fi
+  printf '  %-40s' "2. TCP 监听端口"
+  if port_in_use "$SNELL_PORT"; then printf '%s监听中%s\n' "$C_G" "$C_0"; else printf '%s未监听%s\n' "$C_R" "$C_0"; fi
 
-  printf '  %-40s' "3. 出口 IP"
+  printf '  %-40s' "3. UDP 监听端口（QUIC / HTTP/3 用）"
+  if udp_port_listening "$SNELL_PORT"; then
+    printf '%s监听中%s\n' "$C_G" "$C_0"
+  else
+    printf '%s未监听（QUIC 会回退到 TCP，普通 UDP 不受影响）%s\n' "$C_Y" "$C_0"
+  fi
+
+  printf '  %-40s' "4. 出口 IP"
   local myip=""
   myip="$(public_ip || true)"
   printf '%s\n' "${myip:-（无法访问外网，请手动检查）}"

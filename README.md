@@ -11,7 +11,10 @@ Surge 客户端 ──Snell v5──▶ 中转机（纯转发）──▶ 落地
 ```
 
 - **落地机**：跑 `snell-server`，负责真正出网。可以只放行中转机的 IP，对外完全隐形。
-- **中转机**：**不安装任何代理软件**，只做 iptables 转发（DNAT）。
+- **中转机**：**不安装任何代理软件**，只做 iptables 转发（DNAT，TCP + UDP 都转发）。
+
+> UDP 是给 **QUIC（HTTP/3）** 用的 —— 不转发的话这类流量会失败并回退到 TCP，
+> 每次访问都慢一拍。详见文末「常见问题」。
 
 **为什么这样最快**：Snell 加密是**端到端**的（客户端 ↔ 落地机），中转机全程看不到内容，
 所以没有任何加解密开销，延迟最低。
@@ -123,14 +126,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-re
 
 ```bash
 systemctl status snell-server              # 应为 active
-ss -ltnp | grep 6160                       # snell-server 在监听
+ss -ltnp | grep 6160                       # TCP 监听（Snell 主通道）
+ss -lunp | grep 6160                       # UDP 监听（QUIC / HTTP/3 通道）
 ```
 
 ### 中转机
 
 ```bash
 sysctl net.ipv4.ip_forward                 # 应为 1
-iptables -t nat -S PREROUTING              # 应看到 DNAT 规则
+iptables -t nat -S PREROUTING              # 应看到 TCP 和 UDP 各一条 DNAT 规则
 ```
 
 ### 客户端
@@ -171,8 +175,13 @@ rm -rf /etc/bbk
 
 ## 常见问题
 
+**Q：为什么 TCP 和 UDP 都要转发？**
+UDP 是给 **QUIC（HTTP/3）** 用的。Snell v5 的 QUIC 流量走的是 **UDP over UDP**，
+只转发 TCP 会让这类流量失败并回退到 TCP —— 表现为访问用 HTTP/3 的站点时每次连接慢一拍。
+其他 UDP（DNS、游戏、语音等）走的是 UDP over TCP，不受影响。
+
 **Q：落地机的 Snell 端口需要对外开放吗？**
-不需要。用 `--relay-ip` 指定中转机 IP 后，只有中转机能访问，落地机对外完全隐形。
+不需要。用 `--relay-ip` 指定中转机 IP 后，只有中转机能访问（TCP 和 UDP 都是），落地机对外完全隐形。
 
 **Q：中转机需要安装 Snell 吗？**
 不需要。中转机只做 iptables 转发，不装任何代理软件。
@@ -187,11 +196,16 @@ rm -rf /etc/bbk
 **Q：落地机换了 IP 怎么办？**
 重跑 `deploy-relay.sh --landing-ip <新IP>` 即可。客户端配置不用改（客户端连的是中转机）。
 
+**Q：中转机↔落地机之间的传输安全吗？**
+安全。Snell 加密是**端到端**的（客户端 ↔ 落地机），中转机**没有 PSK**，
+转发的自始至终是密文 —— 即使中转机被入侵，也拿不到明文内容。
+
 ---
 
 ## 安全说明
 
 - 两台机器的 SSH 都会改为**只允许密钥登录**，并安装 fail2ban 防暴力破解
-- 落地机的 Snell 端口默认只对中转机 IP 开放
+- 落地机的 Snell 端口（TCP + UDP）默认只对中转机 IP 开放
+- 中转机↔落地机 之间的流量是 Snell 密文，**中转机没有 PSK，看不到内容**
 - `/etc/bbk/` 下的状态文件含 PSK，权限 600，请勿外发
 - 中转机只需要放行 SSH 端口，不需要额外放行任何端口（转发走的是 FORWARD 链）
