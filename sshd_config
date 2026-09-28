@@ -1,0 +1,136 @@
+# Debian 12 优化的 SSH 配置文件
+
+# 网络配置
+#Port 22                           # 端口将通过脚本修改
+#AddressFamily any
+#ListenAddress 0.0.0.0
+#ListenAddress ::
+
+# 主机密钥
+#HostKey /etc/ssh/ssh_host_rsa_key
+#HostKey /etc/ssh/ssh_host_ecdsa_key
+#HostKey /etc/ssh/ssh_host_ed25519_key
+
+# 加密和密钥交换
+#RekeyLimit default none
+
+# 日志配置
+#SyslogFacility AUTH
+LogLevel INFO                      # 平衡安全和性能，适合低配置VPS
+
+# 认证配置
+LoginGraceTime 2m                  # 登录宽限时间
+#StrictModes yes
+# ⚠️⚠️ MaxAuthTries 不要调小！这是本套脚本最容易把管理员锁死的地方。
+#
+# MaxAuthTries 是「每个连接」允许的认证尝试次数，而 SSH 客户端默认会逐个尝试
+# 本地所有私钥（~/.ssh 下有几把就试几把）。如果管理员本地有 5 把密钥、
+# 服务器却设成 3，客户端试到第 3 把就被掐断，报：
+#     Too many authentication failures
+#
+# 更糟的是叠加上 fail2ban：这几次「试错」会被 sshd[mode=aggressive] 全部计为失败，
+# maxretry=3 一满 → 立刻封禁管理员自己的 IP。等于「连一次就把自己封死」。
+#
+# 实测踩过：三台不同服务器全部中招，只能用商家控制台/重装系统救回来。
+# Debian 默认是 6，这里保持 6，不要调小。
+# 客户端侧的正确做法是加 -o IdentitiesOnly=yes -i <指定私钥>，只试一把。
+MaxAuthTries 6
+MaxSessions 10
+
+# 公钥认证
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+# 禁用不安全的认证方式
+#HostbasedAuthentication no
+#IgnoreUserKnownHosts no
+#IgnoreRhosts yes
+
+# 密码认证（已禁用）
+PasswordAuthentication no          # 禁用密码认证
+PermitEmptyPasswords no           # 禁用空密码
+
+# 交互式认证 - 使用新的选项名
+KbdInteractiveAuthentication no    # 替代过时的 ChallengeResponseAuthentication
+
+# Kerberos 选项
+#KerberosAuthentication no
+#KerberosOrLocalPasswd yes
+#KerberosTicketCleanup yes
+#KerberosGetAFSToken no
+
+# GSSAPI 选项
+#GSSAPIAuthentication no
+#GSSAPICleanupCredentials yes
+
+# PAM 配置
+UsePAM yes                        # 启用PAM以支持更好的会话管理
+
+# 转发配置
+#AllowAgentForwarding yes
+#AllowTcpForwarding yes
+#GatewayPorts no
+X11Forwarding no                  # 服务器通常不需要X11转发，禁用以提高安全性
+#X11DisplayOffset 10
+#X11UseLocalhost yes
+
+# 会话配置
+#PermitTTY yes
+PrintMotd no
+#PrintLastLog yes
+#TCPKeepAlive yes
+#PermitUserEnvironment no
+#Compression delayed
+
+# 连接保活设置
+ClientAliveInterval 300           # 5分钟无活动后发送保活包
+ClientAliveCountMax 2             # 最多发送2次保活包
+
+# DNS和性能
+UseDNS no                         # 禁用DNS反向解析，提高连接速度
+
+# 进程和连接限制
+#PidFile /var/run/sshd.pid
+# ⚠️ MaxStartups 不要调得太窄。
+#    格式是 <开始随机丢弃>:<丢弃概率%>:<完全拒绝>。
+#    曾经写成 5:30:10 —— 公网 IP 天天被扫，未认证连接一旦超过 5 个就开始随机丢弃，
+#    超过 10 个直接全拒。被丢弃时 sshd 不发 banner 就关连接，现象是
+#    「TCP 能连上、但 SSH 报 Connection closed / 拿不到 banner」，极难排查。
+#    这里放宽到 10:30:60（Debian 默认是 10:30:100），既有防护又不误伤自己。
+MaxStartups 10:30:60
+
+# 隧道和其他
+#PermitTunnel no
+#ChrootDirectory none
+#VersionAddendum none
+
+# 横幅
+#Banner /etc/ssh/banner            # 可选：显示登录横幅
+
+# 环境变量
+AcceptEnv LANG LC_*
+
+# SFTP子系统
+Subsystem sftp /usr/lib/openssh/sftp-server
+
+# ROOT登录配置 - 更安全的设置
+PermitRootLogin prohibit-password  # 只允许使用密钥登录root，禁用密码登录
+
+# 用户和组限制（可选配置）
+# AllowUsers user1 user2           # 只允许特定用户登录
+# AllowGroups ssh-users            # 只允许特定组登录
+# DenyUsers baduser                # 禁止特定用户登录
+
+# 针对不同用户的特殊配置示例
+#Match User ansible
+#    PasswordAuthentication no
+#    PubkeyAuthentication yes
+#    AllowTcpForwarding no
+
+# 安全增强配置
+# Protocol 2                      # OpenSSH 7.4+ 已移除此选项，默认只支持协议版本2
+StrictModes yes                   # 严格检查文件权限
+PermitUserEnvironment no          # 禁止用户设置环境变量
+
+# Debian 12 特定优化
+Include /etc/ssh/sshd_config.d/*.conf  # 包含额外配置文件（如果存在）

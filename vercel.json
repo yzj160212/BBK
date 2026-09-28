@@ -1,0 +1,19 @@
+{
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "https://raw.githubusercontent.com/yzj160212/BBK/main/vps.sh",
+      "permanent": true
+    },
+    {
+      "source": "/landing",
+      "destination": "https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-landing.sh",
+      "permanent": true
+    },
+    {
+      "source": "/relay",
+      "destination": "https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-relay.sh",
+      "permanent": true
+    }
+  ]
+}

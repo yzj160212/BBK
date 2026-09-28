@@ -1,0 +1,57 @@
+# fail2ban jail.local 配置文件
+# 针对 Debian 12 优化
+
+[DEFAULT]
+# 全局默认设置
+#
+# bantime 为什么是 1 小时而不是 7 天：
+#   本配置禁用了密码登录 + 开启 aggressive 模式，任何一次「未完成密钥认证的断开」
+#   都计为失败。管理员自己调试（密钥没加载、换机器、用 BatchMode 探测）很容易
+#   在几次之内把自己的出口 IP 封掉。bantime = 604800（7 天）会把管理员一起锁在
+#   门外，而且这台机器只开了 SSH 一个入口，只能重装系统才能救回来 —— 实测踩过。
+#   1 小时对暴力破解依然有足够威慑（攻击者每小时只能试 5 次）。
+bantime  = 3600
+findtime = 600
+maxretry = 5
+
+# 用 systemd 后端直接读 journal。
+# 为什么不用 file 后端读 /var/log/auth.log：
+#   Debian 12 上 sshd 的日志进的是 systemd journal；file 后端依赖 rsyslog 把日志
+#   落到 auth.log，一旦 rsyslog 没装好、没配好、或 logrotate 刚轮转过，fail2ban
+#   就看不到日志，表现为「服务正常但从不封禁」。
+# 注意：systemd 后端需要 python3-systemd 这个包，Debian 的 fail2ban 会自动带上它。
+backend  = systemd
+
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+# ⚠️ 部署脚本会自动把管理员出口 IP 追加到上面这行（--admin-ip 或自动从 SSH_CLIENT 推断）。
+#    换网络/换代理节点后出口 IP 会变，记得重新加一次，否则可能被自己封掉。
+
+[sshd]
+# SSH 服务监控配置
+enabled = true
+
+# 端口由开荒脚本设成实际的 SSH 端口。
+# ⚠️ 这行如果不对，封禁规则会打到 22 端口上 —— 服务看起来一切正常，
+#    但对真实 SSH 端口毫无保护。vps.sh 里会校验并强制写对。
+port    = ssh
+
+# ⚠️⚠️ 必须用 filter = sshd[mode=...] 这种带方括号的写法，不能写成单独一行 mode = ...。
+#
+# 为什么：fail2ban 不会把 jail 级的 mode 选项转发给 filter。
+# 实测（同一台机器，各发 4 次错误密钥登录，看 fail2ban 是否识别）：
+#     filter = sshd  +  单独一行 mode = aggressive   → 识别 0 次  ❌ 无效
+#     filter = sshd[mode=aggressive]                 → 识别 4 次  ✅ 有效
+#     filter = sshd[mode=ddos]                       → 识别 4 次  ✅ 有效
+#
+# 为什么必须是 aggressive/ddos，不能留默认的 normal：
+#   normal 模式把下面这种「预认证阶段断开」的日志标成不计入失败：
+#       Connection closed by authenticating user root <IP> port N [preauth]
+#   而本套配置禁用了密码登录，攻击者只能试密钥；客户端试密钥时先发"查询"不签名，
+#   sshd 直接拒绝、不会记录 Failed publickey，只在连接结束时留下上面那一行。
+#   结果：用真实用户名（如 root）爆破密钥时，normal 模式一条都不计 → 永不封禁。
+#   这就是「fail2ban 正常启动但毫无效果」的根因。
+#
+# aggressive = ddos + extra，会把「预认证阶段断开连接」算作失败。
+filter  = sshd[mode=aggressive]
+
+maxretry = 5
