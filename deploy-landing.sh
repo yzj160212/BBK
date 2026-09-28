@@ -511,6 +511,34 @@ configure_firewall() {
   fi
 }
 
+# 关掉开荒脚本默认放行的 80 / 443。
+# 为什么：开荒脚本是从 Xray 那个项目继承来的，那边 443 是用户入口端口、80 给 ACME 用；
+# 而 BBK 用不到这两个端口，留着只是白白增加暴露面。
+# 参数 $1 = 本方案自己要用的端口（不能误关）。
+# 注意：开荒脚本挑 SSH 端口时会避开 80/443，所以不会误关掉 SSH。
+close_web_ports() {
+  local keep="${1:-}"
+  command -v ufw >/dev/null 2>&1 || return 0
+  local p="" removed="" skipped="" still="" seen=0
+  for p in 80 443; do
+    if [[ "$p" == "$keep" ]]; then skipped="${skipped}${p} "; continue; fi
+    if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+      seen=1
+      ufw delete allow "${p}/tcp" >/dev/null 2>&1 || ufw delete allow "${p}" >/dev/null 2>&1 || true
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+        still="${still}${p} "
+      else
+        removed="${removed}${p} "
+      fi
+    fi
+  done
+  [[ -n "$removed" ]] && log "已关闭开荒默认放行的端口：${removed}（BBK 用不到，减少暴露面）"
+  [[ -n "$skipped" ]] && info "保留端口 ${skipped}（本方案自己要用的）"
+  [[ -n "$still" ]] && warn "端口 ${still} 未能关闭，请手动执行：ufw delete allow <端口>/tcp"
+  [[ "$seen" -eq 0 ]] && info "80/443 本来就未放行"
+  return 0
+}
+
 enable_bbr() {
   local avail=""
   avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
@@ -567,6 +595,7 @@ main() {
     info "  写入 ${SNELL_CONF}（listen 0.0.0.0:${SNELL_PORT}）"
     info "  创建 systemd 服务 snell-server"
     info "  防火墙放行 ${SNELL_PORT}（TCP + UDP）${RELAY_IP:+（仅限 ${RELAY_IP}）}"
+    info "  关闭开荒默认放行的 80 / 443（BBK 用不到，减少暴露面）"
     info "  开启 BBR"
     echo
     log "dry-run 完成，未改动系统"
@@ -580,6 +609,7 @@ main() {
   write_snell_config
   setup_snell_service
   configure_firewall
+  close_web_ports "$SNELL_PORT"
   enable_bbr
 
   # --- 验证 ---
@@ -603,6 +633,20 @@ main() {
   local myip=""
   myip="$(public_ip || true)"
   printf '%s\n' "${myip:-（无法访问外网，请手动检查）}"
+
+  printf '  %-40s' "5. 80 / 443 是否已关闭"
+  local web_open=""
+  if command -v ufw >/dev/null 2>&1; then
+    for p in 80 443; do
+      [[ "$p" == "$SNELL_PORT" ]] && continue
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then web_open="${web_open}${p} "; fi
+    done
+  fi
+  if [[ -n "$web_open" ]]; then
+    printf '%s仍开放：%s%s\n' "$C_Y" "$web_open" "$C_0"
+  else
+    printf '%s已关闭%s\n' "$C_G" "$C_0"
+  fi
 
   hr
   log "落地机部署完成"

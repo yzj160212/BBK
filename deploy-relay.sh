@@ -523,10 +523,10 @@ selftest_forward() {
   [[ -n "$myip" ]] || { info "无法探测公网 IP，跳过转发自检"; return 0; }
 
   if timeout 6 bash -c "exec 3<>/dev/tcp/${myip}/${LISTEN_PORT}" 2>/dev/null; then
-    printf '  %-40s%s可连通%s\n' "5. 转发链路自检（${LISTEN_PORT}）" "$C_G" "$C_0"
+    printf '  %-40s%s可连通%s\n' "6. 转发链路自检（${LISTEN_PORT}）" "$C_G" "$C_0"
   else
     printf '  %-40s%s连不上（客户端仍可能可用，请以客户端实测为准）%s\n' \
-      "5. 转发链路自检（${LISTEN_PORT}）" "$C_Y" "$C_0"
+      "6. 转发链路自检（${LISTEN_PORT}）" "$C_Y" "$C_0"
   fi
 }
 
@@ -656,6 +656,34 @@ setup_userspace() {
   remove_dnat_rules      # 互斥：清掉可能存在的 DNAT 规则
 }
 
+# 关掉开荒脚本默认放行的 80 / 443。
+# 为什么：开荒脚本是从 Xray 那个项目继承来的，那边 443 是用户入口端口、80 给 ACME 用；
+# 而 BBK 用不到这两个端口，留着只是白白增加暴露面。
+# 参数 $1 = 本方案自己要用的端口（不能误关）。
+# 注意：开荒脚本挑 SSH 端口时会避开 80/443，所以不会误关掉 SSH。
+close_web_ports() {
+  local keep="${1:-}"
+  command -v ufw >/dev/null 2>&1 || return 0
+  local p="" removed="" skipped="" still="" seen=0
+  for p in 80 443; do
+    if [[ "$p" == "$keep" ]]; then skipped="${skipped}${p} "; continue; fi
+    if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+      seen=1
+      ufw delete allow "${p}/tcp" >/dev/null 2>&1 || ufw delete allow "${p}" >/dev/null 2>&1 || true
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+        still="${still}${p} "
+      else
+        removed="${removed}${p} "
+      fi
+    fi
+  done
+  [[ -n "$removed" ]] && log "已关闭开荒默认放行的端口：${removed}（BBK 用不到，减少暴露面）"
+  [[ -n "$skipped" ]] && info "保留端口 ${skipped}（本方案自己要用的）"
+  [[ -n "$still" ]] && warn "端口 ${still} 未能关闭，请手动执行：ufw delete allow <端口>/tcp"
+  [[ "$seen" -eq 0 ]] && info "80/443 本来就未放行"
+  return 0
+}
+
 # ============================ 主流程 ============================
 main() {
   hr
@@ -703,6 +731,7 @@ main() {
       info "  ufw reload 并校验规则"
       info "  停用可能存在的用户态转发（两种模式互斥）"
     fi
+    info "  关闭开荒默认放行的 80 / 443（BBK 用不到，减少暴露面）"
     echo
     log "dry-run 完成，未改动系统"
     hr
@@ -717,6 +746,7 @@ main() {
     need_cmd iptables || die "找不到 iptables，请先执行开荒（它会安装 iptables）。"
     setup_dnat
   fi
+  close_web_ports "$LISTEN_PORT"
 
   # --- 验证 ---
   echo
@@ -773,6 +803,20 @@ main() {
     else
       printf '%sTCP:%s  UDP:%s%s\n' "$C_R" "$r_tcp" "$r_udp" "$C_0"
     fi
+  fi
+
+  printf '  %-40s' "5. 80 / 443 是否已关闭"
+  local web_open=""
+  if command -v ufw >/dev/null 2>&1; then
+    for p in 80 443; do
+      [[ "$p" == "$LISTEN_PORT" ]] && continue
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then web_open="${web_open}${p} "; fi
+    done
+  fi
+  if [[ -n "$web_open" ]]; then
+    printf '%s仍开放：%s%s\n' "$C_Y" "$web_open" "$C_0"
+  else
+    printf '%s已关闭%s\n' "$C_G" "$C_0"
   fi
 
   selftest_forward

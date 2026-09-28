@@ -157,6 +157,7 @@ mtr -rwzc 50 <落地机IP>
 systemctl status snell-server              # 应为 active
 ss -ltnp | grep 6160                       # TCP 监听（Snell 主通道）
 ss -lunp | grep 6160                       # UDP 监听（QUIC / HTTP/3 通道）
+ufw status                                 # 确认 80 / 443 已关闭
 ```
 
 ### 中转机
@@ -170,6 +171,7 @@ cat /etc/bbk/state-relay.env               # 看当前用的是哪种模式
 ```bash
 sysctl net.ipv4.ip_forward                 # 应为 1
 iptables -t nat -S PREROUTING              # 应看到 TCP 和 UDP 各一条 DNAT 规则
+ufw status                                 # 确认 80 / 443 已关闭
 ```
 
 **`userspace` 模式：**
@@ -178,6 +180,7 @@ iptables -t nat -S PREROUTING              # 应看到 TCP 和 UDP 各一条 DNA
 systemctl status bbk-gost                  # 应为 active
 ss -ltnp | grep 6160                       # TCP 监听
 ss -lunp | grep 6160                       # UDP 监听
+ufw status                                 # 确认 80 / 443 已关闭
 ```
 
 ### 客户端
@@ -260,8 +263,23 @@ gost 永远收不到包，排查起来很费劲）。
 
 ## 安全说明
 
+### 暴露的端口
+
+| 机器 | 端口 | 对谁开放 |
+| --- | --- | --- |
+| **中转机** | SSH（随机 20000-60000） | 全网（仅密钥登录 + fail2ban） |
+| **中转机** | 转发端口（TCP + UDP） | 全网 —— 客户端要连，且客户端 IP 不固定，**无法限制来源** |
+| **落地机** | SSH（随机） | 全网（同上） |
+| **落地机** | Snell 端口（TCP + UDP） | **只对中转机 IP** —— 落地机对外完全隐形 |
+
+> 开荒脚本会默认放行 80 / 443（那是从另一个项目继承的），**本脚本会自动关掉它们**
+> —— BBK 用不到这两个端口，留着只是白白增加暴露面。
+> 将来需要（比如要放网站）：`ufw allow 80/tcp && ufw allow 443/tcp`。
+
+### 其他
+
 - 两台机器的 SSH 都会改为**只允许密钥登录**，并安装 fail2ban 防暴力破解
-- 落地机的 Snell 端口（TCP + UDP）默认只对中转机 IP 开放
 - 中转机↔落地机 之间的流量是 Snell 密文，**中转机没有 PSK，看不到内容**
+- 落地机是整套里最敏感的一台（它持有 PSK、能看到明文），但它的暴露面反而最小
+- UDP 端口**做不成反射放大攻击的跳板**（Snell 的 QUIC 握手带鉴权，未鉴权的包直接丢弃）
 - `/etc/bbk/` 下的状态文件含 PSK，权限 600，请勿外发
-- 中转机只需要放行 SSH 端口，不需要额外放行任何端口（转发走的是 FORWARD 链）
