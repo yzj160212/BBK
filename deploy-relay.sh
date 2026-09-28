@@ -9,10 +9,28 @@
 #
 # ⚠️ 本脚本**不安装任何代理软件**，中转机只是一个"透明管道"：
 #    Snell 加密是端到端（客户端 <-> 落地机）的，中转机全程看不到内容，
-#    因此没有任何加解密开销，延迟最低。
+#    因此没有任何加解密开销。
 #
 # TCP 和 UDP 都转发。UDP 是给 QUIC（HTTP/3）用的 —— Snell v5 的 QUIC Proxy Mode
 # 走的是 UDP over UDP，只转发 TCP 会让这类流量失败并回退到 TCP，每次连接慢一拍。
+#
+# ============================ 两种转发模式（--mode）============================
+#
+#   --mode dnat（默认）      内核态 iptables DNAT。客户端与落地机是**一条端到端 TCP**。
+#                            · 优点：零用户态开销、不需要额外组件
+#                            · 缺点：leg1/leg2 的丢包会**互相拖累**（端到端拥塞控制）
+#
+#   --mode userspace        用户态转发（gost）。中转机终结客户端 TCP，另开一条到落地机。
+#                            · 优点：**两条 TCP 独立**，丢包互不影响；中转机缓冲区能吸收抖动
+#                            · 缺点：多一个组件、有用户态拷贝开销
+#
+#   ⚠️ 两者的**延迟基本一样**（数据路径的逻辑往返距离都是 leg1+leg2），
+#      差别在丢包链路上的吞吐和抗抖动。选哪个看实测：
+#          mtr -rwzc 50 <落地机IP>     # 在中转机上跑，看 leg2 丢包
+#      丢包 ≈ 0 → dnat 够用；有持续丢包 → userspace 明显更好。
+#
+#   ⚠️ 两种模式**互斥**：脚本会自动清掉另一种模式的配置，不会出现两套并存
+#      （否则 DNAT 会在 PREROUTING 就截走流量，gost 永远收不到包，排查起来很费劲）。
 #
 # 用法：
 #   bash deploy-relay.sh --landing-ip <落地机公网IP>
@@ -43,6 +61,7 @@ BOOTSTRAP_MARKER="/etc/bbk/bootstrap.done"
 LANDING_IP=""                # 落地机公网 IP（必填）
 LANDING_PORT="6160"          # 落地机上 snell-server 的端口
 LISTEN_PORT=""               # 中转机对外监听端口；留空 = 与 LANDING_PORT 相同
+MODE="dnat"                  # 转发模式：dnat（默认，内核态）| userspace（gost，TCP 分段）
 FORCE=0
 DRY_RUN=0
 STATE_DIR="/etc/bbk"
@@ -51,6 +70,9 @@ UFW_DEFAULT="/etc/default/ufw"
 SYSCTL_CONF="/etc/sysctl.d/99-bbk-forward.conf"
 MARK_BEGIN="# BEGIN BBK-RELAY"
 MARK_END="# END BBK-RELAY"
+GOST_VER="3.3.0"
+GOST_BIN="/usr/local/bin/gost"
+GOST_UNIT="/etc/systemd/system/bbk-gost.service"
 
 # ============================ 输出工具 ============================
 if [[ -t 1 ]]; then
@@ -80,6 +102,17 @@ TCP 和 UDP 都转发 —— UDP 是为了让 QUIC（HTTP/3）能正常走 UDP-o
   --landing-port <端口>  落地机上 snell-server 的端口（默认 6160）
   --listen-port <端口>   中转机对外监听端口（默认与 --landing-port 相同，
                          这样客户端配置只需改 IP、不用改端口）
+  --mode <模式>          转发方式，二选一（默认 dnat）：
+                           dnat       内核态 iptables DNAT，零额外组件。
+                                      客户端与落地机是一条端到端 TCP，
+                                      leg1/leg2 的丢包会互相拖累。
+                           userspace  用户态转发（gost），两条 TCP 独立，
+                                      丢包互不影响、能吸收抖动。多一个组件。
+
+                         ⚠️ 两者延迟基本一样，差别在丢包链路下的吞吐。
+                            建议先在中转机跑 `mtr -rwzc 50 <落地机IP>` 看 leg2 丢包：
+                            丢包 ≈ 0 用 dnat；有持续丢包用 userspace。
+                            两种模式互斥，重跑会自动清掉另一种。
 
 开荒参数（第 1 步，会改动 SSH 登录方式）：
   --ssh-port <端口>      开荒后 SSH 使用的端口（默认随机挑 20000-60000）
@@ -95,6 +128,7 @@ TCP 和 UDP 都转发 —— UDP 是为了让 QUIC（HTTP/3）能正常走 UDP-o
 例子：
   bash deploy-relay.sh --landing-ip 198.51.100.20
   bash deploy-relay.sh --landing-ip 198.51.100.20 --listen-port 6160
+  bash deploy-relay.sh --landing-ip 198.51.100.20 --mode userspace
 EOF
 }
 
@@ -104,6 +138,7 @@ while [[ $# -gt 0 ]]; do
     --landing-ip)        LANDING_IP="${2:-}";     shift; [[ $# -gt 0 ]] && shift || true ;;
     --landing-port)      LANDING_PORT="${2:-}";   shift; [[ $# -gt 0 ]] && shift || true ;;
     --listen-port)       LISTEN_PORT="${2:-}";    shift; [[ $# -gt 0 ]] && shift || true ;;
+    --mode)              MODE="${2:-}";           shift; [[ $# -gt 0 ]] && shift || true ;;
     --force)             FORCE=1; shift ;;
     --dry-run)           DRY_RUN=1; shift ;;
     --ssh-port)          SSH_PORT="${2:-}";       shift; [[ $# -gt 0 ]] && shift || true ;;
@@ -185,6 +220,22 @@ listen_lines() {
 port_in_use() {
   local port="$1"
   [[ -n "$(listen_lines | awk -v p="$port" '$4 ~ "[.:]"p"$"{print; exit}')" ]]
+}
+
+# UDP 监听套接字。注意 UDP 的 State 列是 UNCONN 而不是 LISTEN，
+# 所以不能复用 listen_lines()（那个按 $1=="LISTEN" 过滤）。
+udp_listen_lines() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -lunp 2>/dev/null | awk 'NR>1' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ulnp 2>/dev/null | awk '$1 ~ /^udp/' || true
+  fi
+}
+
+# 判断某 UDP 端口是否在监听（用户态模式下用来确认 gost 的 UDP 通道起来了）
+udp_port_listening() {
+  local port="$1"
+  [[ -n "$(udp_listen_lines | awk -v p="$port" '$4 ~ "[.:]"p"$"{print; exit}')" ]]
 }
 
 pick_ssh_port() {
@@ -472,11 +523,137 @@ selftest_forward() {
   [[ -n "$myip" ]] || { info "无法探测公网 IP，跳过转发自检"; return 0; }
 
   if timeout 6 bash -c "exec 3<>/dev/tcp/${myip}/${LISTEN_PORT}" 2>/dev/null; then
-    printf '  %-40s%s可连通%s\n' "4. 转发链路自检（${LISTEN_PORT}）" "$C_G" "$C_0"
+    printf '  %-40s%s可连通%s\n' "5. 转发链路自检（${LISTEN_PORT}）" "$C_G" "$C_0"
   else
     printf '  %-40s%s连不上（客户端仍可能可用，请以客户端实测为准）%s\n' \
-      "4. 转发链路自检（${LISTEN_PORT}）" "$C_Y" "$C_0"
+      "5. 转发链路自检（${LISTEN_PORT}）" "$C_Y" "$C_0"
   fi
+}
+
+# ============================ 用户态转发（gost）============================
+
+# gost 的资产命名和 snell 不一样：amd64 / arm64 / 386 / armv7
+gost_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    i386|i686)     printf '386' ;;
+    armv7l)        printf 'armv7' ;;
+    *)             die "gost 不支持的 CPU 架构：$(uname -m)" ;;
+  esac
+}
+
+install_gost() {
+  if [[ -x "$GOST_BIN" && "$FORCE" -ne 1 ]]; then
+    info "已安装 gost（$("$GOST_BIN" -V 2>/dev/null | head -n1 || echo 未知版本)），跳过下载（--force 可强制重装）"
+    return 0
+  fi
+  local arch="" url="" tmp="" tgz="" bin=""
+  arch="$(gost_arch)"
+  url="https://github.com/go-gost/gost/releases/download/v${GOST_VER}/gost_${GOST_VER}_linux_${arch}.tar.gz"
+  info "下载 gost v${GOST_VER}（${arch}）"
+  need_cmd tar || { apt-get update -qq && apt-get install -y -qq tar; }
+  tmp="$(mktemp -d)"; tgz="$tmp/gost.tar.gz"
+  if ! curl -fsSL --max-time 120 -o "$tgz" "$url"; then
+    rm -rf "$tmp"
+    die "下载失败：$url
+     中转机需要能访问 GitHub。若网络不通，可手动下载后把 gost 放到 $GOST_BIN。"
+  fi
+  tar -xzf "$tgz" -C "$tmp" || { rm -rf "$tmp"; die "解压失败（文件可能不完整），请重试。"; }
+  bin="$(find "$tmp" -type f -name gost | head -n1)"
+  [[ -n "$bin" ]] || { rm -rf "$tmp"; die "解压后没找到 gost 可执行文件。"; }
+  install -m 755 "$bin" "$GOST_BIN"
+  rm -rf "$tmp"
+  log "gost 已安装到 $GOST_BIN"
+}
+
+write_gost_service() {
+  cat > "$GOST_UNIT" <<EOF
+[Unit]
+Description=BBK gost TCP/UDP forwarder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${GOST_BIN} -L tcp://:${LISTEN_PORT}/${LANDING_IP}:${LANDING_PORT} -L udp://:${LISTEN_PORT}/${LANDING_IP}:${LANDING_PORT}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable bbk-gost >/dev/null 2>&1 || true
+  if ! systemctl restart bbk-gost; then
+    err "gost 启动失败，最近日志："
+    journalctl -u bbk-gost -n 20 --no-pager 2>/dev/null || true
+    die "请把上面日志发给开发者。"
+  fi
+  sleep 1
+  if ! systemctl is-active --quiet bbk-gost; then
+    err "gost 未能保持运行，最近日志："
+    journalctl -u bbk-gost -n 20 --no-pager 2>/dev/null || true
+    die "请把上面日志发给开发者。"
+  fi
+  log "gost 已启动并设为开机自启（${LISTEN_PORT} TCP+UDP -> ${LANDING_IP}:${LANDING_PORT}）"
+}
+
+# 用户态转发时流量是投递到本机套接字（走 INPUT 链），
+# 所以必须在 ufw 放行监听端口 —— 这点和 DNAT（走 FORWARD 链）完全不同，
+# 忘了放行会表现为「端口完全连不上」。
+allow_relay_port_input() {
+  command -v ufw >/dev/null 2>&1 || { warn "没有 ufw，跳过防火墙配置"; return 0; }
+  ufw allow "${LISTEN_PORT}/tcp" >/dev/null 2>&1 || true
+  ufw allow "${LISTEN_PORT}/udp" >/dev/null 2>&1 || true
+  log "防火墙：放行本机 ${LISTEN_PORT}（TCP + UDP）入站"
+}
+
+# 停掉用户态转发（切回 dnat 时用）
+stop_gost() {
+  if [[ -f "$GOST_UNIT" ]] \
+     || systemctl is-enabled bbk-gost >/dev/null 2>&1 \
+     || systemctl is-active bbk-gost >/dev/null 2>&1; then
+    systemctl disable --now bbk-gost >/dev/null 2>&1 || true
+    rm -f "$GOST_UNIT"
+    systemctl daemon-reload
+    info "已停用并移除用户态转发（bbk-gost）"
+  fi
+}
+
+# 移除 DNAT 规则块（切到 userspace 时用）
+remove_dnat_rules() {
+  [[ -f "$UFW_BEFORE" ]] || return 0
+  grep -qF "$MARK_BEGIN" "$UFW_BEFORE" || return 0
+  cp -a "$UFW_BEFORE" "${UFW_BEFORE}.bak-$(date +%Y%m%d%H%M%S)"
+  local tmp=""; tmp="$(mktemp)"
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip { print }
+  ' "$UFW_BEFORE" > "$tmp"
+  cat "$tmp" > "$UFW_BEFORE"
+  rm -f "$tmp"
+  ufw reload >/dev/null 2>&1 || systemctl restart ufw >/dev/null 2>&1 || true
+  info "已移除原有的 DNAT 转发规则"
+}
+
+setup_dnat() {
+  enable_ip_forward
+  allow_ufw_forward
+  apply_dnat_rules
+  reload_ufw
+  stop_gost              # 互斥：清掉可能存在的用户态转发
+}
+
+setup_userspace() {
+  install_gost
+  write_gost_service
+  allow_relay_port_input
+  remove_dnat_rules      # 互斥：清掉可能存在的 DNAT 规则
 }
 
 # ============================ 主流程 ============================
@@ -495,20 +672,37 @@ main() {
   [[ -n "$LISTEN_PORT" ]] || LISTEN_PORT="$LANDING_PORT"
   [[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] && (( LISTEN_PORT >= 1 && LISTEN_PORT <= 65535 )) \
     || die "--listen-port 必须是 1-65535 之间的数字：$LISTEN_PORT"
+  case "$MODE" in
+    dnat|userspace) ;;
+    *) die "--mode 只能是 dnat 或 userspace，收到的是：$MODE" ;;
+  esac
 
   run_bootstrap
 
   hr
-  printf '%s第 2 步 / 共 2 步：配置纯 TCP 转发%s\n' "$C_B" "$C_0"
-  printf '  中转机不装代理软件，只做 DNAT —— Snell 加密是端到端的，中转机不解密\n'
+  printf '%s第 2 步 / 共 2 步：配置转发%s\n' "$C_B" "$C_0"
+  if [[ "$MODE" == "userspace" ]]; then
+    printf '  模式：userspace（gost 用户态转发，两条 TCP 独立，抗丢包）\n'
+  else
+    printf '  模式：dnat（内核态 iptables 转发，零额外组件）\n'
+  fi
+  printf '  中转机不装代理软件 —— Snell 加密是端到端的，中转机不解密\n'
   hr
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     info "dry-run：以下动作不会真正执行"
-    info "  开启 net.ipv4.ip_forward"
-    info "  设置 ${UFW_DEFAULT} 的 DEFAULT_FORWARD_POLICY=ACCEPT"
-    info "  在 ${UFW_BEFORE} 写入 DNAT：${LISTEN_PORT}（TCP + UDP）-> ${LANDING_IP}:${LANDING_PORT}"
-    info "  ufw reload 并校验规则"
+    if [[ "$MODE" == "userspace" ]]; then
+      info "  下载并安装 gost v${GOST_VER}（架构 $(gost_arch)）"
+      info "  创建 systemd 服务 bbk-gost：${LISTEN_PORT}（TCP + UDP）-> ${LANDING_IP}:${LANDING_PORT}"
+      info "  ufw 放行 ${LISTEN_PORT}（TCP + UDP）入站"
+      info "  移除可能存在的 DNAT 规则（两种模式互斥）"
+    else
+      info "  开启 net.ipv4.ip_forward"
+      info "  设置 ${UFW_DEFAULT} 的 DEFAULT_FORWARD_POLICY=ACCEPT"
+      info "  在 ${UFW_BEFORE} 写入 DNAT：${LISTEN_PORT}（TCP + UDP）-> ${LANDING_IP}:${LANDING_PORT}"
+      info "  ufw reload 并校验规则"
+      info "  停用可能存在的用户态转发（两种模式互斥）"
+    fi
     echo
     log "dry-run 完成，未改动系统"
     hr
@@ -516,40 +710,69 @@ main() {
   fi
 
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "配置转发需要 root 权限（sudo bash $0 ...）"
-  need_cmd iptables || die "找不到 iptables，请先执行开荒（它会安装 iptables）。"
   need_cmd ufw || die "找不到 ufw，请先执行开荒（它会安装 ufw）。"
-
-  enable_ip_forward
-  allow_ufw_forward
-  apply_dnat_rules
-  reload_ufw
+  if [[ "$MODE" == "userspace" ]]; then
+    setup_userspace
+  else
+    need_cmd iptables || die "找不到 iptables，请先执行开荒（它会安装 iptables）。"
+    setup_dnat
+  fi
 
   # --- 验证 ---
   echo
   printf '%s验证%s\n' "$C_B" "$C_0"
   hr
-  printf '  %-40s' "1. IP 转发"
-  if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" == "1" ]]; then
-    printf '%s已开启%s\n' "$C_G" "$C_0"
+  printf '  %-40s' "1. 转发模式"
+  if [[ "$MODE" == "userspace" ]]; then
+    printf '%suserspace（gost）%s\n' "$C_G" "$C_0"
   else
-    printf '%s未开启%s\n' "$C_R" "$C_0"
+    printf '%sdnat（内核态）%s\n' "$C_G" "$C_0"
   fi
 
-  printf '  %-40s' "2. ufw 转发策略"
-  if grep -qE '^[[:space:]]*DEFAULT_FORWARD_POLICY="ACCEPT"' "$UFW_DEFAULT"; then
-    printf '%s已允许%s\n' "$C_G" "$C_0"
-  else
-    printf '%s仍为 DROP%s\n' "$C_R" "$C_0"
-  fi
+  if [[ "$MODE" == "userspace" ]]; then
+    printf '  %-40s' "2. gost 服务状态"
+    if systemctl is-active --quiet bbk-gost; then printf '%sactive%s\n' "$C_G" "$C_0"; else printf '%s未运行%s\n' "$C_R" "$C_0"; fi
 
-  printf '  %-40s' "3. DNAT 规则"
-  local r_tcp="缺" r_udp="缺"
-  if dnat_rule_present tcp; then r_tcp="有"; fi
-  if dnat_rule_present udp; then r_udp="有"; fi
-  if [[ "$r_tcp" == "有" && "$r_udp" == "有" ]]; then
-    printf '%sTCP + UDP 都已写入%s\n' "$C_G" "$C_0"
+    printf '  %-40s' "3. 监听端口"
+    local l_tcp="TCP✗" l_udp="UDP✗"
+    if port_in_use "$LISTEN_PORT"; then l_tcp="TCP✓"; fi
+    if udp_port_listening "$LISTEN_PORT"; then l_udp="UDP✓"; fi
+    if [[ "$l_tcp" == "TCP✓" && "$l_udp" == "UDP✓" ]]; then
+      printf '%s%s %s%s\n' "$C_G" "$l_tcp" "$l_udp" "$C_0"
+    else
+      printf '%s%s %s%s\n' "$C_R" "$l_tcp" "$l_udp" "$C_0"
+    fi
+
+    printf '  %-40s' "4. ufw 放行"
+    if ufw status 2>/dev/null | grep -q "^${LISTEN_PORT}/tcp"; then
+      printf '%s已放行%s\n' "$C_G" "$C_0"
+    else
+      printf '%s未见放行规则%s\n' "$C_Y" "$C_0"
+    fi
   else
-    printf '%sTCP:%s  UDP:%s%s\n' "$C_R" "$r_tcp" "$r_udp" "$C_0"
+    printf '  %-40s' "2. IP 转发"
+    if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" == "1" ]]; then
+      printf '%s已开启%s\n' "$C_G" "$C_0"
+    else
+      printf '%s未开启%s\n' "$C_R" "$C_0"
+    fi
+
+    printf '  %-40s' "3. ufw 转发策略"
+    if grep -qE '^[[:space:]]*DEFAULT_FORWARD_POLICY="ACCEPT"' "$UFW_DEFAULT"; then
+      printf '%s已允许%s\n' "$C_G" "$C_0"
+    else
+      printf '%s仍为 DROP%s\n' "$C_R" "$C_0"
+    fi
+
+    printf '  %-40s' "4. DNAT 规则"
+    local r_tcp="缺" r_udp="缺"
+    if dnat_rule_present tcp; then r_tcp="有"; fi
+    if dnat_rule_present udp; then r_udp="有"; fi
+    if [[ "$r_tcp" == "有" && "$r_udp" == "有" ]]; then
+      printf '%sTCP + UDP 都已写入%s\n' "$C_G" "$C_0"
+    else
+      printf '%sTCP:%s  UDP:%s%s\n' "$C_R" "$r_tcp" "$r_udp" "$C_0"
+    fi
   fi
 
   selftest_forward
@@ -574,11 +797,13 @@ main() {
     "$C_D" "${myip:-<本机IP>}" "$LISTEN_PORT" "$LANDING_IP" "$LANDING_PORT" "$C_0"
   echo
   printf '%s  想改端口/换落地机：重跑本脚本即可（规则是幂等的，不会叠加）%s\n' "$C_D" "$C_0"
+  printf '%s  想换转发模式：加 --mode userspace 或 --mode dnat 重跑（会自动切换）%s\n' "$C_D" "$C_0"
   hr
 
   mkdir -p "$STATE_DIR"
   {
     printf '# 由 deploy-relay.sh 生成于 %s\n' "$(date -Iseconds)"
+    printf 'MODE=%s\n' "$MODE"
     printf 'RELAY_IP=%s\n' "${myip:-}"
     printf 'LISTEN_PORT=%s\n' "$LISTEN_PORT"
     printf 'LANDING_IP=%s\n' "$LANDING_IP"

@@ -11,7 +11,9 @@ Surge 客户端 ──Snell v5──▶ 中转机（纯转发）──▶ 落地
 ```
 
 - **落地机**：跑 `snell-server`，负责真正出网。可以只放行中转机的 IP，对外完全隐形。
-- **中转机**：**不安装任何代理软件**，只做 iptables 转发（DNAT，TCP + UDP 都转发）。
+- **中转机**：**不安装任何代理软件**，只做纯转发（TCP + UDP）。两种方式可选：
+  - `--mode dnat`（默认）：内核态 iptables 转发，零额外组件
+  - `--mode userspace`：用户态转发（gost），两条 TCP 独立，抗丢包更好
 
 > UDP 是给 **QUIC（HTTP/3）** 用的 —— 不转发的话这类流量会失败并回退到 TCP，
 > 每次访问都慢一拍。详见文末「常见问题」。
@@ -105,6 +107,33 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-re
 | `--landing-ip <IP>` | **必填**，落地机公网 IP | —— |
 | `--landing-port <端口>` | 落地机上 snell-server 的端口 | `6160` |
 | `--listen-port <端口>` | 中转机对外监听端口 | 与 `--landing-port` 相同 |
+| `--mode <模式>` | 转发方式：`dnat` 或 `userspace` | `dnat` |
+
+#### 两种转发模式怎么选
+
+| | `dnat`（默认） | `userspace` |
+| --- | --- | --- |
+| 实现 | 内核态 iptables DNAT | 用户态转发（gost） |
+| 客户端与落地机 | **一条端到端 TCP** | **两条独立 TCP** |
+| 延迟 | 基本一样 | 基本一样 |
+| 丢包链路的吞吐 | ❌ leg1/leg2 丢包**互相拖累** | ✅ 两条 TCP 独立，**互不影响** |
+| 抖动吸收 | ❌ 无 | ✅ 中转机缓冲区能吸收 |
+| 额外组件 | 无 | 需要 gost |
+
+**怎么判断该用哪个** —— 在中转机上测 leg2 的丢包：
+
+```bash
+apt install -y mtr-tiny
+mtr -rwzc 50 <落地机IP>
+```
+
+- 全程丢包 ≈ **0%** → `dnat` 够用（更简单）
+- 有**持续丢包** → `userspace` 明显更好
+
+> 切换模式就是重跑一次（会自动清掉另一种，不会并存）：
+> ```bash
+> bash deploy-relay.sh --landing-ip <IP> --mode userspace
+> ```
 
 ---
 
@@ -133,8 +162,22 @@ ss -lunp | grep 6160                       # UDP 监听（QUIC / HTTP/3 通道�
 ### 中转机
 
 ```bash
+cat /etc/bbk/state-relay.env               # 看当前用的是哪种模式
+```
+
+**`dnat` 模式：**
+
+```bash
 sysctl net.ipv4.ip_forward                 # 应为 1
 iptables -t nat -S PREROUTING              # 应看到 TCP 和 UDP 各一条 DNAT 规则
+```
+
+**`userspace` 模式：**
+
+```bash
+systemctl status bbk-gost                  # 应为 active
+ss -ltnp | grep 6160                       # TCP 监听
+ss -lunp | grep 6160                       # UDP 监听
 ```
 
 ### 客户端
@@ -164,6 +207,9 @@ rm -rf /etc/snell /etc/bbk
 systemctl daemon-reload
 
 # 中转机
+systemctl disable --now bbk-gost 2>/dev/null
+rm -f /etc/systemd/system/bbk-gost.service /usr/local/bin/gost
+systemctl daemon-reload
 ufw disable && ufw --force reset && ufw enable
 rm -f /etc/sysctl.d/99-bbk-forward.conf
 sed -i '/^# BEGIN BBK-RELAY$/,/^# END BBK-RELAY$/d' /etc/ufw/before.rules
@@ -189,6 +235,16 @@ UDP 是给 **QUIC（HTTP/3）** 用的。Snell v5 的 QUIC 流量走的是 **UDP
 **Q：为什么不用 Surge 的链式代理（underlying-proxy）？**
 链式代理要做两层 Snell 加解密，中转机还要额外建连、客户端还要穿过隧道做嵌套握手，
 延迟明显更高。纯转发不解密，开销几乎为零。
+
+**Q：`--mode dnat` 和 `--mode userspace` 该选哪个？**
+**延迟基本一样**，差别在丢包链路下的吞吐：`dnat` 是端到端一条 TCP，
+leg1/leg2 的丢包会互相拖累；`userspace` 是两条独立 TCP，丢包互不影响。
+在中转机上 `mtr -rwzc 50 <落地机IP>` 测一下 —— 丢包 ≈ 0 用 `dnat`，有持续丢包用 `userspace`。
+详见上方「两种转发模式怎么选」。
+
+**Q：两种模式能同时开吗？**
+不能，也不需要。脚本会自动清掉另一种（否则 DNAT 会在 PREROUTING 就截走流量，
+gost 永远收不到包，排查起来很费劲）。
 
 **Q：中转机换了 IP 怎么办？**
 重跑 `deploy-landing.sh --relay-ip <新IP>`，更新落地机的防火墙白名单即可。
