@@ -456,10 +456,19 @@ allow_ufw_forward() {
 }
 
 # 判断某协议的 DNAT 规则是否已生效（$1 = tcp 或 udp）
+#
+# ⚠️ 不能用 `grep -- "-p tcp --dport 6160 -j DNAT"` 这种死板的写法：
+#    `iptables -S` 会把匹配模块也打印出来，实际行长这样 ——
+#        -A PREROUTING -p tcp -m tcp --dport 6160 -j DNAT --to-destination ...
+#    中间多了个 `-m tcp`，死板模式永远匹配不上 → **规则明明生效了也报「没生效」**，
+#    然后脚本 die 掉，后面的步骤（关 80/443 等）全都不会执行。
+#    这里改成用 awk 分别检查三个特征，容忍中间插入的模块参数。
 dnat_rule_present() {
   local proto="$1"
-  iptables -t nat -S PREROUTING 2>/dev/null \
-    | grep -q -- "-p ${proto} --dport ${LISTEN_PORT} -j DNAT" || return 1
+  iptables -t nat -S PREROUTING 2>/dev/null | awk -v p="$proto" -v d="$LISTEN_PORT" '
+    index($0, "-p " p " ") && index($0, "--dport " d " ") && index($0, "-j DNAT") { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
 }
 
 # 把 DNAT / MASQUERADE 规则写进 /etc/ufw/before.rules。
