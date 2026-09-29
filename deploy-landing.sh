@@ -496,6 +496,25 @@ EOF
   log "snell-server 已启动并设为开机自启"
 }
 
+# 清掉「上一次部署用的端口」在 ufw 里的规则。
+# 为什么需要：改端口重跑时（比如 6160 → 443），configure_firewall 只会为**新端口**
+# 加规则，旧端口那两条「只允许中转机」的规则会永远留着 —— 虽然不影响功能，
+# 但会让人以为端口还开着，也让 `ufw status` 越来越乱。
+clean_stale_firewall() {
+  local old=""
+  old="$(awk -F= '/^SNELL_PORT=/{print $2; exit}' "$STATE_DIR/state.env" 2>/dev/null || true)"
+  old="${old//[[:space:]]/}"
+  [[ -z "$old" || "$old" == "$SNELL_PORT" ]] && return 0
+  command -v ufw >/dev/null 2>&1 || return 0
+  if [[ -n "$RELAY_IP" ]]; then
+    ufw delete allow from "$RELAY_IP" to any port "$old" proto tcp >/dev/null 2>&1 || true
+    ufw delete allow from "$RELAY_IP" to any port "$old" proto udp >/dev/null 2>&1 || true
+  fi
+  ufw delete allow "${old}/tcp" >/dev/null 2>&1 || true
+  ufw delete allow "${old}/udp" >/dev/null 2>&1 || true
+  info "已清理上一次部署端口 ${old} 的防火墙规则"
+}
+
 configure_firewall() {
   command -v ufw >/dev/null 2>&1 || { warn "没有 ufw，跳过防火墙配置"; return 0; }
   # TCP + UDP 都要放行：UDP 是给 Snell v5 的 QUIC Proxy Mode（HTTP/3）用的
@@ -651,6 +670,7 @@ main() {
   install_snell
   write_snell_config
   setup_snell_service
+  clean_stale_firewall
   configure_firewall
   close_web_ports "$SNELL_PORT"
   tune_kernel_network
