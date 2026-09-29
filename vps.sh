@@ -55,6 +55,7 @@ VPS_ASSUME_YES="${VPS_ASSUME_YES:-0}"
 VPS_NO_REBOOT="${VPS_NO_REBOOT:-0}"
 VPS_FORCE_REBOOT="${VPS_FORCE_REBOOT:-0}"
 VPS_SKIP_DEBIAN_CHECK="${VPS_SKIP_DEBIAN_CHECK:-0}"
+VPS_KEEP_VENDOR_PRESETS="${VPS_KEEP_VENDOR_PRESETS:-0}"
 
 # ============================================================================
 # 配置文件下载地址
@@ -192,6 +193,9 @@ vps.sh — Debian 12 VPS 开荒脚本（SSH 加固 + fail2ban + UFW + 日志优�
   --no-reboot            结束时不要重启（deploy-*.sh 默认使用，避免打断后续步骤）
   --reboot               结束时强制重启
   --skip-debian-check    跳过「非 Debian 12」的确认提示
+  --keep-vendor-presets  保留 VPS 商家预装的「伪优化」脚本
+                         （默认会清掉：那些每 N 分钟 sync + 清空 drop_caches
+                          的脚本对代理服务有害无益，而且常是 777 权限有隐患）
   -h, --help             显示本帮助
 
 对应环境变量：
@@ -211,6 +215,7 @@ while [[ $# -gt 0 ]]; do
         --no-reboot)         VPS_NO_REBOOT=1; shift ;;
         --reboot)            VPS_FORCE_REBOOT=1; VPS_NO_REBOOT=0; shift ;;
         --skip-debian-check) VPS_SKIP_DEBIAN_CHECK=1; shift ;;
+        --keep-vendor-presets) VPS_KEEP_VENDOR_PRESETS=1; shift ;;
         -h|--help)           vps_usage; exit 0 ;;
         *)                   print_error "未知参数：$1"; vps_usage; exit 1 ;;
     esac
@@ -917,6 +922,74 @@ configure_firewall() {
     ufw status numbered
 }
 
+# ============================================================================
+# 清理 VPS 商家预装的「伪优化」脚本
+# ----------------------------------------------------------------------------
+# 为什么需要：不少商家会在系统里预置一个 cron，每 N 分钟执行
+#     sync; echo 1|2|3 > /proc/sys/vm/drop_caches
+# 号称「释放内存」。实际对代理 / 网络服务**有害无益** ——
+# 清空 page cache 只会让后续读盘变慢，而这类服务根本不依赖文件系统缓存。
+# 更糟的是这类脚本常被设成 777 权限（实测遇到过 `-rwxrwxrwx /usr/freemem.sh`），
+# 任何本地用户都能替换它 —— 这是实打实的隐患。
+#
+# ⚠️ 重装系统后商家预置会再次出现，所以放进开荒脚本里**每次自动清掉**。
+# 用 --keep-vendor-presets 可跳过（比如你确实想留着它）。
+#
+# 判定标准只认一个特征：**被 cron 引用、且内容里写了 `drop_caches`**。
+# 不碰商家别的脚本，避免误删。
+# ============================================================================
+clean_vendor_presets() {
+    if [ "${VPS_KEEP_VENDOR_PRESETS:-0}" -eq 1 ]; then
+        print_info "已指定 --keep-vendor-presets，跳过商家预置脚本清理"
+        CONFIG_LIST+="✓ 商家预置脚本清理 已跳过\n"
+        return 0
+    fi
+
+    print_info "正在检查 VPS 商家预装的优化脚本..."
+
+    local removed=0 p="" cronfile="" tmp="" base=""
+
+    for p in /usr/*.sh /usr/local/bin/*.sh /usr/local/sbin/*.sh \
+             /opt/*.sh /opt/*/*.sh /root/*.sh /etc/cron.hourly/* \
+             /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/*; do
+        [ -f "$p" ] || continue
+        grep -qE 'drop_caches' "$p" 2>/dev/null || continue
+
+        base="$(basename "$p")"
+        print_warning "发现商家预置脚本：$p（内容含 drop_caches）"
+
+        # ① root crontab：用 crontab 命令改，最正确
+        if crontab -l 2>/dev/null | grep -qF "$base"; then
+            crontab -l 2>/dev/null | grep -vF "$base" | crontab -
+            print_info "  已从 root crontab 移除对 $base 的引用"
+        fi
+
+        # ② /etc/crontab 和 /etc/cron.d/*：纯文本文件，直接改
+        for cronfile in /etc/crontab /etc/cron.d/*; do
+            [ -f "$cronfile" ] || continue
+            grep -qF "$base" "$cronfile" 2>/dev/null || continue
+            tmp="$(mktemp)"
+            grep -vF "$base" "$cronfile" > "$tmp" 2>/dev/null && cat "$tmp" > "$cronfile"
+            rm -f "$tmp"
+            print_info "  已从 $cronfile 移除对 $base 的引用"
+        done
+
+        # ③ 删掉脚本本体
+        rm -f "$p"
+        print_info "  已删除：$p"
+        removed=$((removed + 1))
+    done
+
+    if [ "$removed" -gt 0 ]; then
+        print_info "共清理 $removed 个商家预置脚本"
+        CONFIG_LIST+="✓ 清理商家预置脚本（$removed 个）成功\n"
+    else
+        print_info "未发现商家预置的伪优化脚本"
+        CONFIG_LIST+="✓ 商家预置脚本检查（无需清理）成功\n"
+    fi
+    return 0
+}
+
 # 主函数
 main() {
     print_info "开始执行 Debian 12 VPS 配置脚本..."
@@ -1040,7 +1113,10 @@ main() {
     
     # 配置 SSH
     configure_ssh "$SSH_PORT" "$SSH_PUBLIC_KEY"
-    
+
+    # 清理 VPS 商家预装的「伪优化」脚本（重装系统后会再次出现，所以每次开荒都清）
+    clean_vendor_presets
+
     # 配置 fail2ban
     if configure_fail2ban "$SSH_PORT"; then
         print_info "fail2ban 配置完成"
