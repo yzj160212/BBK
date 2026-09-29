@@ -51,7 +51,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-la
 跑完会打印一行 **Surge 配置**，**先记下来**（里面有自动生成的 PSK）：
 
 ```
-落地机 = snell, <中转机IP>, 6160, psk=xxxxxxxxxxxxxxxxxxxx, version=5
+落地机 = snell, <中转机IP>, 443, psk=xxxxxxxxxxxxxxxxxxxx, version=5
 ```
 
 ### 第 2 步 · 中转机（入口端）
@@ -70,7 +70,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-re
 把那一行粘进 Surge 的 `[Proxy]` 段：
 
 ```
-落地机 = snell, <中转机IP>, 6160, psk=你的PSK, version=5
+落地机 = snell, <中转机IP>, 443, psk=你的PSK, version=5
 ```
 
 > 服务器地址填的是**中转机**的 IP，不是落地机的。
@@ -96,7 +96,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-re
 | 参数 | 说明 | 默认 |
 | --- | --- | --- |
 | `--relay-ip <IP>` | 中转机 IP。填了只允许它访问 Snell 端口 | 不填则对全网开放 |
-| `--snell-port <端口>` | snell-server 监听端口 | `6160` |
+| `--snell-port <端口>` | snell-server 监听端口 | `443` |
 | `--psk <密钥>` | 预共享密钥 | 自动生成 |
 | `--force` | 已部署过时强制重做（**会换 PSK**） | 关 |
 
@@ -105,7 +105,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yzj160212/BBK/main/deploy-re
 | 参数 | 说明 | 默认 |
 | --- | --- | --- |
 | `--landing-ip <IP>` | **必填**，落地机公网 IP | —— |
-| `--landing-port <端口>` | 落地机上 snell-server 的端口 | `6160` |
+| `--landing-port <端口>` | 落地机上 snell-server 的端口 | `443` |
 | `--listen-port <端口>` | 中转机对外监听端口 | 与 `--landing-port` 相同 |
 | `--mode <模式>` | 转发方式：`dnat` 或 `userspace` | `dnat` |
 
@@ -155,9 +155,9 @@ mtr -rwzc 50 <落地机IP>
 
 ```bash
 systemctl status snell-server              # 应为 active
-ss -ltnp | grep 6160                       # TCP 监听（Snell 主通道）
-ss -lunp | grep 6160                       # UDP 监听（QUIC / HTTP/3 通道）
-ufw status                                 # 确认 80 / 443 已关闭
+ss -ltnp | grep 443                       # TCP 监听（Snell 主通道）
+ss -lunp | grep 443                       # UDP 监听（QUIC / HTTP/3 通道）
+ufw status                                 # 确认 80/443 已对全网关闭
 ```
 
 ### 中转机
@@ -170,17 +170,28 @@ cat /etc/bbk/state-relay.env               # 看当前用的是哪种模式
 
 ```bash
 sysctl net.ipv4.ip_forward                 # 应为 1
-iptables -t nat -S PREROUTING              # 应看到 TCP 和 UDP 各一条 DNAT 规则
-ufw status                                 # 确认 80 / 443 已关闭
+iptables -t nat -S PREROUTING              # 应看到 TCP 和 UDP **各 1 条** DNAT 规则
+ufw status                                 # 确认 80/443 已对全网关闭
+```
+
+> 如果看到 2 条以上（重复），重跑一次脚本即可 —— 脚本会先清掉内核里的残留再重建。
+
+### 内核参数（两台机器都会自动设置）
+
+```bash
+sysctl net.netfilter.nf_conntrack_max                # 应为 65536（默认只有 8192）
+sysctl net.core.netdev_max_backlog                   # 应为 16384（默认 1000）
+sysctl net.core.rmem_max                             # 应为 16777216（默认 208KB）
+cat /etc/sysctl.d/99-bbk-net.conf                    # 全部参数
 ```
 
 **`userspace` 模式：**
 
 ```bash
 systemctl status bbk-gost                  # 应为 active
-ss -ltnp | grep 6160                       # TCP 监听
-ss -lunp | grep 6160                       # UDP 监听
-ufw status                                 # 确认 80 / 443 已关闭
+ss -ltnp | grep 443                       # TCP 监听
+ss -lunp | grep 443                       # UDP 监听
+ufw status                                 # 确认 80/443 已对全网关闭
 ```
 
 ### 客户端
@@ -272,8 +283,11 @@ gost 永远收不到包，排查起来很费劲）。
 | **落地机** | SSH（随机） | 全网（同上） |
 | **落地机** | Snell 端口（TCP + UDP） | **只对中转机 IP** —— 落地机对外完全隐形 |
 
-> 开荒脚本会默认放行 80 / 443（那是从另一个项目继承的），**本脚本会自动关掉它们**
-> —— BBK 用不到这两个端口，留着只是白白增加暴露面。
+> **默认端口是 443**（不用 6160 这种 Snell 招牌端口）—— 443 最不显眼，
+> 而且能兼容「只放行常见端口」的公司/学校/酒店网络。
+>
+> 开荒脚本会默认把 80 / 443 对全网放行（那是从另一个项目继承的），
+> **本脚本会把这两条「对全网」的规则收紧** —— 业务端口只按上面表格里的来源放行。
 > 将来需要（比如要放网站）：`ufw allow 80/tcp && ufw allow 443/tcp`。
 
 ### 其他

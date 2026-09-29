@@ -12,7 +12,7 @@
 #
 # 用法：
 #   bash deploy-landing.sh --relay-ip <中转机公网IP>
-#   bash deploy-landing.sh --relay-ip <中转机IP> --snell-port 6160 --ssh-port 22222
+#   bash deploy-landing.sh --relay-ip <中转机IP> --snell-port 443 --ssh-port 22222
 #   bash deploy-landing.sh --skip-bootstrap --relay-ip <中转机IP>   # 已开荒过的机器
 #   bash deploy-landing.sh --help
 #
@@ -37,7 +37,7 @@ BOOTSTRAP_MARKER="/etc/bbk/bootstrap.done"   # 开荒完成标记（用于识别
 
 # ============================ Snell 参数（第 2 步）============================
 SNELL_VER="v5.0.1"
-SNELL_PORT="6160"            # snell-server 监听端口
+SNELL_PORT="443"             # snell-server 监听端口（默认 443：最不显眼、且兼容受限网络）
 SNELL_PSK=""                 # 预共享密钥；留空 = 自动生成
 RELAY_IP=""                  # 中转机公网 IP（填了就只允许它访问本机 Snell 端口）
 FORCE=0
@@ -71,7 +71,7 @@ deploy-landing.sh v1.0.0 — 落地机（出口端）一键部署（开荒 + Sne
 Snell 参数：
   --relay-ip <IP>        中转机公网 IP。填了就只允许它访问本机 Snell 端口，
                          落地机对外完全隐形；同时客户端配置会用它作为服务器地址。
-  --snell-port <端口>    snell-server 监听端口（默认 6160，TCP 和 UDP 都监听）
+  --snell-port <端口>    snell-server 监听端口（默认 443，TCP 和 UDP 都监听）
   --psk <密钥>           预共享密钥；不填自动生成（推荐自动生成）
   --force                已部署过时强制重做（会重新生成 PSK！客户端要同步改）
 
@@ -511,47 +511,90 @@ configure_firewall() {
   fi
 }
 
-# 关掉开荒脚本默认放行的 80 / 443。
+# ============================ 内核网络参数调优 ============================
+# 系统默认值对代理场景偏小。实测两台机器的真实问题：
+#   · nf_conntrack_max = 8192（多连接场景容易打满）
+#   · nf_conntrack_udp_timeout = 30 秒（长 UDP 会话被提前回收）
+#   · netdev_max_backlog = 1000（高流量时网卡丢包，两台都有大量 rx_dropped）
+#   · socket 缓冲区 208KB（跨境高延迟链路太小）
+#
+# ⚠️ 只调「只增不减」的参数。**不动 nf_conntrack_tcp_timeout_established** ——
+#    缩短已建立连接的超时会把空闲连接掐断，反而制造新的「断连」。
+tune_kernel_network() {
+  local f="/etc/sysctl.d/99-bbk-net.conf"
+  local avail=""
+  avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
+  {
+    printf '# BBK 代理场景的内核网络参数调优（由 BBK 脚本生成）\n'
+    printf '# conntrack：默认 8192 太小，多用户/多连接场景容易打满\n'
+    printf 'net.netfilter.nf_conntrack_max = 65536\n'
+    printf '# UDP 会话超时：默认 30 秒，QUIC / 长 UDP 会话会被提前回收\n'
+    printf 'net.netfilter.nf_conntrack_udp_timeout = 300\n'
+    printf 'net.netfilter.nf_conntrack_udp_timeout_stream = 600\n'
+    printf '# 网卡收包队列：默认 1000，高流量时会丢包\n'
+    printf 'net.core.netdev_max_backlog = 16384\n'
+    printf 'net.core.somaxconn = 4096\n'
+    printf '# socket 缓冲区：高延迟链路（跨境）很关键，默认 208KB 太小\n'
+    printf 'net.core.rmem_max = 16777216\n'
+    printf 'net.core.wmem_max = 16777216\n'
+    printf 'net.ipv4.tcp_rmem = 4096 87380 16777216\n'
+    printf 'net.ipv4.tcp_wmem = 4096 65536 16777216\n'
+    printf '# MTU 探测：链路 PMTU 异常时自动降级，避免连接卡死\n'
+    printf 'net.ipv4.tcp_mtu_probing = 1\n'
+    printf '# 空闲后不重置拥塞窗口：交互式使用更顺\n'
+    printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
+    if [[ "$avail" == *bbr* ]]; then
+      printf '# BBR 拥塞控制 + fq 队列\n'
+      printf 'net.core.default_qdisc = fq\n'
+      printf 'net.ipv4.tcp_congestion_control = bbr\n'
+    fi
+  } > "$f"
+
+  sysctl --system >/dev/null 2>&1 || true
+
+  local cmax="" cc=""
+  cmax="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '')"
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '')"
+  if [[ -n "$cmax" ]]; then
+    log "内核网络参数已优化（conntrack_max=${cmax}${cc:+, 拥塞控制=${cc}}）"
+  else
+    warn "内核参数已写入 $f，但 nf_conntrack 模块当前未加载（重启后生效）"
+  fi
+}
+
+# 收紧开荒脚本默认对全网放行的 80 / 443。
 # 为什么：开荒脚本是从 Xray 那个项目继承来的，那边 443 是用户入口端口、80 给 ACME 用；
-# 而 BBK 用不到这两个端口，留着只是白白增加暴露面。
-# 参数 $1 = 本方案自己要用的端口（不能误关）。
+# 而 BBK 用不到「对全网开放」的这两个端口，留着只是白白增加暴露面。
+#
+# ⚠️ 只删「ALLOW Anywhere」那条，不能因为「这个端口本方案要用」就整条跳过 ——
+#    如果落地机的 Snell 端口正好设成 443，开荒留下的 `443/tcp ALLOW Anywhere`
+#    会让落地机**不再隐形**。前面 configure_firewall 已经加过
+#    「只允许中转机 IP」的限制版规则，删掉全网那条正好。
+# 参数 $1 = 本方案自己要用的端口（仅用于提示）。
 # 注意：开荒脚本挑 SSH 端口时会避开 80/443，所以不会误关掉 SSH。
 close_web_ports() {
-  local keep="${1:-}"
+  local biz_port="${1:-}"
   command -v ufw >/dev/null 2>&1 || return 0
-  local p="" removed="" skipped="" still="" seen=0
+  local p="" removed="" still="" seen=0
   for p in 80 443; do
-    if [[ "$p" == "$keep" ]]; then skipped="${skipped}${p} "; continue; fi
-    if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+    if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere"; then
       seen=1
       ufw delete allow "${p}/tcp" >/dev/null 2>&1 || ufw delete allow "${p}" >/dev/null 2>&1 || true
-      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere"; then
         still="${still}${p} "
       else
         removed="${removed}${p} "
       fi
     fi
   done
-  [[ -n "$removed" ]] && log "已关闭开荒默认放行的端口：${removed}（BBK 用不到，减少暴露面）"
-  [[ -n "$skipped" ]] && info "保留端口 ${skipped}（本方案自己要用的）"
-  [[ -n "$still" ]] && warn "端口 ${still} 未能关闭，请手动执行：ufw delete allow <端口>/tcp"
-  [[ "$seen" -eq 0 ]] && info "80/443 本来就未放行"
-  return 0
-}
-
-enable_bbr() {
-  local avail=""
-  avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-  if [[ "$avail" != *bbr* ]]; then
-    warn "内核未提供 BBR，跳过拥塞控制优化（不影响功能）"
-    return 0
+  [[ -n "$removed" ]] && log "已收紧开荒默认对全网放行的端口：${removed}"
+  [[ -n "$still" ]] && warn "端口 ${still} 仍对全网开放，请手动执行：ufw delete allow <端口>/tcp"
+  [[ "$seen" -eq 0 ]] && info "80/443 本来就未对全网放行"
+  if [[ "$biz_port" == "80" || "$biz_port" == "443" ]]; then
+    info "业务端口就是 ${biz_port}，只按上面配置的来源放行（不是全网）"
   fi
-  cat > /etc/sysctl.d/99-bbk-bbr.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-  log "已开启 BBR（拥塞控制 bbr + 队列 fq）"
+  return 0
 }
 
 public_ip() {
@@ -595,8 +638,8 @@ main() {
     info "  写入 ${SNELL_CONF}（listen 0.0.0.0:${SNELL_PORT}）"
     info "  创建 systemd 服务 snell-server"
     info "  防火墙放行 ${SNELL_PORT}（TCP + UDP）${RELAY_IP:+（仅限 ${RELAY_IP}）}"
-    info "  关闭开荒默认放行的 80 / 443（BBK 用不到，减少暴露面）"
-    info "  开启 BBR"
+    info "  关闭开荒默认对全网放行的 80 / 443"
+    info "  内核网络参数调优（conntrack / 缓冲区 / BBR）→ /etc/sysctl.d/99-bbk-net.conf"
     echo
     log "dry-run 完成，未改动系统"
     hr
@@ -610,7 +653,7 @@ main() {
   setup_snell_service
   configure_firewall
   close_web_ports "$SNELL_PORT"
-  enable_bbr
+  tune_kernel_network
 
   # --- 验证 ---
   echo
@@ -634,12 +677,11 @@ main() {
   myip="$(public_ip || true)"
   printf '%s\n' "${myip:-（无法访问外网，请手动检查）}"
 
-  printf '  %-40s' "5. 80 / 443 是否已关闭"
+  printf '  %-40s' "5. 80 / 443 是否已对全网关闭"
   local web_open=""
   if command -v ufw >/dev/null 2>&1; then
     for p in 80 443; do
-      [[ "$p" == "$SNELL_PORT" ]] && continue
-      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then web_open="${web_open}${p} "; fi
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere"; then web_open="${web_open}${p} "; fi
     done
   fi
   if [[ -n "$web_open" ]]; then

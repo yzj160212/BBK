@@ -34,7 +34,7 @@
 #
 # 用法：
 #   bash deploy-relay.sh --landing-ip <落地机公网IP>
-#   bash deploy-relay.sh --landing-ip <落地机IP> --landing-port 6160 --listen-port 6160
+#   bash deploy-relay.sh --landing-ip <落地机IP> --landing-port 443 --listen-port 443
 #   bash deploy-relay.sh --skip-bootstrap --landing-ip <落地机IP>   # 已开荒过的机器
 #   bash deploy-relay.sh --help
 #
@@ -59,7 +59,7 @@ BOOTSTRAP_MARKER="/etc/bbk/bootstrap.done"
 
 # ============================ 转发参数（第 2 步）============================
 LANDING_IP=""                # 落地机公网 IP（必填）
-LANDING_PORT="6160"          # 落地机上 snell-server 的端口
+LANDING_PORT="443"           # 落地机上 snell-server 的端口
 LISTEN_PORT=""               # 中转机对外监听端口；留空 = 与 LANDING_PORT 相同
 MODE="dnat"                  # 转发模式：dnat（默认，内核态）| userspace（gost，TCP 分段）
 FORCE=0
@@ -99,7 +99,7 @@ TCP 和 UDP 都转发 —— UDP 是为了让 QUIC（HTTP/3）能正常走 UDP-o
 
 转发参数：
   --landing-ip <IP>      落地机公网 IP（必填）
-  --landing-port <端口>  落地机上 snell-server 的端口（默认 6160）
+  --landing-port <端口>  落地机上 snell-server 的端口（默认 443）
   --listen-port <端口>   中转机对外监听端口（默认与 --landing-port 相同，
                          这样客户端配置只需改 IP、不用改端口）
   --mode <模式>          转发方式，二选一（默认 dnat）：
@@ -127,7 +127,7 @@ TCP 和 UDP 都转发 —— UDP 是为了让 QUIC（HTTP/3）能正常走 UDP-o
 
 例子：
   bash deploy-relay.sh --landing-ip 198.51.100.20
-  bash deploy-relay.sh --landing-ip 198.51.100.20 --listen-port 6160
+  bash deploy-relay.sh --landing-ip 198.51.100.20 --listen-port 443
   bash deploy-relay.sh --landing-ip 198.51.100.20 --mode userspace
 EOF
 }
@@ -455,20 +455,39 @@ allow_ufw_forward() {
   fi
 }
 
-# 判断某协议的 DNAT 规则是否已生效（$1 = tcp 或 udp）
+# 统计本端口上某协议的 DNAT 规则条数（$1 = tcp 或 udp）
 #
-# ⚠️ 不能用 `grep -- "-p tcp --dport 6160 -j DNAT"` 这种死板的写法：
+# ⚠️ 不能用 `grep -- "-p tcp --dport 443 -j DNAT"` 这种死板的写法：
 #    `iptables -S` 会把匹配模块也打印出来，实际行长这样 ——
-#        -A PREROUTING -p tcp -m tcp --dport 6160 -j DNAT --to-destination ...
-#    中间多了个 `-m tcp`，死板模式永远匹配不上 → **规则明明生效了也报「没生效」**，
-#    然后脚本 die 掉，后面的步骤（关 80/443 等）全都不会执行。
-#    这里改成用 awk 分别检查三个特征，容忍中间插入的模块参数。
-dnat_rule_present() {
+#        -A PREROUTING -p tcp -m tcp --dport 443 -j DNAT --to-destination ...
+#    中间多了个 `-m tcp`，死板模式永远匹配不上 → **规则明明生效了也报「没生效」**。
+#    所以用 awk 分别检查特征，容忍中间插入的模块参数。
+#    端口后面要加边界，避免 dport 443 误匹配 dport 4431。
+dnat_rule_count() {
   local proto="$1"
   iptables -t nat -S PREROUTING 2>/dev/null | awk -v p="$proto" -v d="$LISTEN_PORT" '
-    index($0, "-p " p " ") && index($0, "--dport " d " ") && index($0, "-j DNAT") { found = 1 }
-    END { exit(found ? 0 : 1) }
+    index($0, "-p " p " ") && $0 ~ ("--dport " d "([^0-9]|$)") && index($0, "-j DNAT") { n++ }
+    END { print n + 0 }
   '
+}
+
+# 清掉内核里本端口的残留 DNAT 规则。
+#
+# ⚠️ 为什么必须做：实测发现 `ufw reload` **并不会**清掉 nat 表里已有的规则 ——
+#    真机上 before.rules 里只有 1 个块（4 行 DNAT），但内核里跑着 **2 份共 4 条**。
+#    也就是说脚本跑两次就会叠加。虽然不影响功能（首条匹配后不再看后面的），
+#    但状态很脏、也让「校验」失去意义。
+#    所以每次应用规则前，先把本端口在内核里的 DNAT 规则全删干净，再 reload 重建。
+clean_live_dnat() {
+  local proto="" nums="" n=""
+  for proto in tcp udp; do
+    nums="$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | awk -v p="$proto" -v d="$LISTEN_PORT" '
+      $1 ~ /^[0-9]+$/ && $3 == p && $0 ~ ("dpt:" d "([^0-9]|$)") { print $1 }
+    ' | sort -rn)"
+    for n in $nums; do
+      iptables -t nat -D PREROUTING "$n" >/dev/null 2>&1 || true
+    done
+  done
 }
 
 # 把 DNAT / MASQUERADE 规则写进 /etc/ufw/before.rules。
@@ -504,19 +523,34 @@ EOF
 
   cat "$blk" "$tmp" > "$UFW_BEFORE"
   rm -f "$tmp" "$blk"
+  clean_live_dnat          # 先清内核残留，随后 ufw reload 会按 before.rules 重建
   log "已写入转发规则：${LISTEN_PORT}（TCP + UDP）  ->  ${LANDING_IP}:${LANDING_PORT}"
 }
 
 reload_ufw() {
+  clean_live_dnat          # 再清一次，确保 reload 是从干净状态重建
   if ! ufw reload >/dev/null 2>&1; then
     warn "ufw reload 失败，尝试 restart"
     systemctl restart ufw >/dev/null 2>&1 || true
   fi
   sleep 1
-  if dnat_rule_present tcp && dnat_rule_present udp; then
-    log "转发规则已生效（TCP + UDP）"
+  local c_tcp="" c_udp=""
+  c_tcp="$(dnat_rule_count tcp)"; c_udp="$(dnat_rule_count udp)"
+  if [[ "$c_tcp" == "1" && "$c_udp" == "1" ]]; then
+    log "转发规则已生效（TCP + UDP 各 1 条）"
+  elif (( c_tcp >= 1 && c_udp >= 1 )); then
+    warn "规则生效但有重复（TCP ${c_tcp} 条 / UDP ${c_udp} 条），正在清理"
+    clean_live_dnat
+    ufw reload >/dev/null 2>&1 || true
+    sleep 1
+    c_tcp="$(dnat_rule_count tcp)"; c_udp="$(dnat_rule_count udp)"
+    if [[ "$c_tcp" == "1" && "$c_udp" == "1" ]]; then
+      log "已清理干净（TCP + UDP 各 1 条）"
+    else
+      warn "仍为 TCP ${c_tcp} 条 / UDP ${c_udp} 条 —— 不影响功能（首条匹配后不再看后面的），但请留意"
+    fi
   else
-    err "转发规则没有完整生效，当前 nat PREROUTING："
+    err "转发规则没有生效（TCP ${c_tcp} 条 / UDP ${c_udp} 条），当前 nat PREROUTING："
     iptables -t nat -S PREROUTING 2>/dev/null | sed 's/^/    /' || true
     die "请把上面内容发给开发者。"
   fi
@@ -536,6 +570,58 @@ selftest_forward() {
   else
     printf '  %-40s%s连不上（客户端仍可能可用，请以客户端实测为准）%s\n' \
       "6. 转发链路自检（${LISTEN_PORT}）" "$C_Y" "$C_0"
+  fi
+}
+
+# ============================ 内核网络参数调优 ============================
+# 系统默认值对代理场景偏小。实测两台机器的真实问题：
+#   · nf_conntrack_max = 8192（多连接场景容易打满）
+#   · nf_conntrack_udp_timeout = 30 秒（长 UDP 会话被提前回收）
+#   · netdev_max_backlog = 1000（高流量时网卡丢包，两台都有大量 rx_dropped）
+#   · socket 缓冲区 208KB（跨境高延迟链路太小）
+#
+# ⚠️ 只调「只增不减」的参数。**不动 nf_conntrack_tcp_timeout_established** ——
+#    缩短已建立连接的超时会把空闲连接掐断，反而制造新的「断连」。
+tune_kernel_network() {
+  local f="/etc/sysctl.d/99-bbk-net.conf"
+  local avail=""
+  avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+
+  {
+    printf '# BBK 代理场景的内核网络参数调优（由 BBK 脚本生成）\n'
+    printf '# conntrack：默认 8192 太小，多用户/多连接场景容易打满\n'
+    printf 'net.netfilter.nf_conntrack_max = 65536\n'
+    printf '# UDP 会话超时：默认 30 秒，QUIC / 长 UDP 会话会被提前回收\n'
+    printf 'net.netfilter.nf_conntrack_udp_timeout = 300\n'
+    printf 'net.netfilter.nf_conntrack_udp_timeout_stream = 600\n'
+    printf '# 网卡收包队列：默认 1000，高流量时会丢包\n'
+    printf 'net.core.netdev_max_backlog = 16384\n'
+    printf 'net.core.somaxconn = 4096\n'
+    printf '# socket 缓冲区：高延迟链路（跨境）很关键，默认 208KB 太小\n'
+    printf 'net.core.rmem_max = 16777216\n'
+    printf 'net.core.wmem_max = 16777216\n'
+    printf 'net.ipv4.tcp_rmem = 4096 87380 16777216\n'
+    printf 'net.ipv4.tcp_wmem = 4096 65536 16777216\n'
+    printf '# MTU 探测：链路 PMTU 异常时自动降级，避免连接卡死\n'
+    printf 'net.ipv4.tcp_mtu_probing = 1\n'
+    printf '# 空闲后不重置拥塞窗口：交互式使用更顺\n'
+    printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
+    if [[ "$avail" == *bbr* ]]; then
+      printf '# BBR 拥塞控制（用户态转发模式下中转机也受益）\n'
+      printf 'net.core.default_qdisc = fq\n'
+      printf 'net.ipv4.tcp_congestion_control = bbr\n'
+    fi
+  } > "$f"
+
+  sysctl --system >/dev/null 2>&1 || true
+
+  local cmax="" cc=""
+  cmax="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '')"
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '')"
+  if [[ -n "$cmax" ]]; then
+    log "内核网络参数已优化（conntrack_max=${cmax}${cc:+, 拥塞控制=${cc}}）"
+  else
+    warn "内核参数已写入 $f，但 nf_conntrack 模块当前未加载（重启后生效）"
   fi
 }
 
@@ -665,31 +751,33 @@ setup_userspace() {
   remove_dnat_rules      # 互斥：清掉可能存在的 DNAT 规则
 }
 
-# 关掉开荒脚本默认放行的 80 / 443。
+# 收紧开荒脚本默认对全网放行的 80 / 443。
 # 为什么：开荒脚本是从 Xray 那个项目继承来的，那边 443 是用户入口端口、80 给 ACME 用；
-# 而 BBK 用不到这两个端口，留着只是白白增加暴露面。
-# 参数 $1 = 本方案自己要用的端口（不能误关）。
+# 而 BBK 用不到「对全网开放」的这两个端口，留着只是白白增加暴露面。
+#
+# ⚠️ 只删「ALLOW Anywhere」那条，不能因为「这个端口本方案要用」就整条跳过 ——
+#    如果转发端口正好设成 443，开荒留下的 `443/tcp ALLOW Anywhere` 就是多余的
+#    （DNAT 走 FORWARD 链、用户态转发会自己 ufw allow，都不需要这条全网规则）。
+# 参数 $1 = 本方案自己要用的端口（仅用于提示）。
 # 注意：开荒脚本挑 SSH 端口时会避开 80/443，所以不会误关掉 SSH。
 close_web_ports() {
-  local keep="${1:-}"
+  local biz_port="${1:-}"
   command -v ufw >/dev/null 2>&1 || return 0
-  local p="" removed="" skipped="" still="" seen=0
+  local p="" removed="" still="" seen=0
   for p in 80 443; do
-    if [[ "$p" == "$keep" ]]; then skipped="${skipped}${p} "; continue; fi
-    if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+    if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere"; then
       seen=1
       ufw delete allow "${p}/tcp" >/dev/null 2>&1 || ufw delete allow "${p}" >/dev/null 2>&1 || true
-      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere"; then
         still="${still}${p} "
       else
         removed="${removed}${p} "
       fi
     fi
   done
-  [[ -n "$removed" ]] && log "已关闭开荒默认放行的端口：${removed}（BBK 用不到，减少暴露面）"
-  [[ -n "$skipped" ]] && info "保留端口 ${skipped}（本方案自己要用的）"
-  [[ -n "$still" ]] && warn "端口 ${still} 未能关闭，请手动执行：ufw delete allow <端口>/tcp"
-  [[ "$seen" -eq 0 ]] && info "80/443 本来就未放行"
+  [[ -n "$removed" ]] && log "已收紧开荒默认对全网放行的端口：${removed}"
+  [[ -n "$still" ]] && warn "端口 ${still} 仍对全网开放，请手动执行：ufw delete allow <端口>/tcp"
+  [[ "$seen" -eq 0 ]] && info "80/443 本来就未对全网放行"
   return 0
 }
 
@@ -740,7 +828,8 @@ main() {
       info "  ufw reload 并校验规则"
       info "  停用可能存在的用户态转发（两种模式互斥）"
     fi
-    info "  关闭开荒默认放行的 80 / 443（BBK 用不到，减少暴露面）"
+    info "  关闭开荒默认对全网放行的 80 / 443"
+    info "  内核网络参数调优（conntrack / 缓冲区 / BBR）→ /etc/sysctl.d/99-bbk-net.conf"
     echo
     log "dry-run 完成，未改动系统"
     hr
@@ -756,6 +845,7 @@ main() {
     setup_dnat
   fi
   close_web_ports "$LISTEN_PORT"
+  tune_kernel_network
 
   # --- 验证 ---
   echo
@@ -804,22 +894,22 @@ main() {
     fi
 
     printf '  %-40s' "4. DNAT 规则"
-    local r_tcp="缺" r_udp="缺"
-    if dnat_rule_present tcp; then r_tcp="有"; fi
-    if dnat_rule_present udp; then r_udp="有"; fi
-    if [[ "$r_tcp" == "有" && "$r_udp" == "有" ]]; then
-      printf '%sTCP + UDP 都已写入%s\n' "$C_G" "$C_0"
+    local c_tcp="" c_udp=""
+    c_tcp="$(dnat_rule_count tcp)"; c_udp="$(dnat_rule_count udp)"
+    if [[ "$c_tcp" == "1" && "$c_udp" == "1" ]]; then
+      printf '%sTCP + UDP 各 1 条%s\n' "$C_G" "$C_0"
+    elif (( c_tcp >= 1 && c_udp >= 1 )); then
+      printf '%sTCP %s 条 / UDP %s 条（有重复，不影响功能）%s\n' "$C_Y" "$c_tcp" "$c_udp" "$C_0"
     else
-      printf '%sTCP:%s  UDP:%s%s\n' "$C_R" "$r_tcp" "$r_udp" "$C_0"
+      printf '%sTCP %s 条 / UDP %s 条%s\n' "$C_R" "$c_tcp" "$c_udp" "$C_0"
     fi
   fi
 
-  printf '  %-40s' "5. 80 / 443 是否已关闭"
+  printf '  %-40s' "5. 80 / 443 是否已对全网关闭"
   local web_open=""
   if command -v ufw >/dev/null 2>&1; then
     for p in 80 443; do
-      [[ "$p" == "$LISTEN_PORT" ]] && continue
-      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]"; then web_open="${web_open}${p} "; fi
+      if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere"; then web_open="${web_open}${p} "; fi
     done
   fi
   if [[ -n "$web_open" ]]; then
