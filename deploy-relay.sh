@@ -471,21 +471,26 @@ dnat_rule_count() {
   '
 }
 
-# 清掉内核里残留的 DNAT 规则。
+# 清掉内核里残留的 DNAT / MASQUERADE 规则。
 #
 # ⚠️ 为什么必须做：实测发现 `ufw reload` **并不会**清掉 nat 表里已有的规则 ——
 #    真机上 before.rules 里只有 1 个块，内核里却跑着 2 份共 4 条。
 #    脚本跑两次就会叠加（虽然不影响功能：首条匹配后不再看后面的，但状态很脏）。
-# ⚠️ 而且**必须清「所有」DNAT 规则，不能只清当前端口** ——
+# ⚠️ 而且**必须清「所有」规则，不能只清当前端口** ——
 #    否则改端口时（比如 6160 → 443），旧端口的规则会永远留在内核里。
-#    中转机的 nat PREROUTING 完全由本脚本管理，before.rules 是唯一事实来源，
-#    所以这里直接清空整条链，随后 ufw reload 会按 before.rules 重建。
+# ⚠️ 2026-09-29 真机体检又发现：**POSTROUTING 的 MASQUERADE 也要清** ——
+#    我第一版只清了 PREROUTING，结果 6160 的 MASQUERADE 残留 4 条、443 还重复了 4 条。
+#    中转机的 nat 表完全由本脚本管理、before.rules 是唯一事实来源，
+#    所以两张链都清空，随后 ufw reload 会按 before.rules 重建。
 clean_live_dnat() {
-  local nums="" n=""
-  nums="$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null \
-          | awk '$1 ~ /^[0-9]+$/ && $2 == "DNAT" { print $1 }' | sort -rn)"
-  for n in $nums; do
-    iptables -t nat -D PREROUTING "$n" >/dev/null 2>&1 || true
+  local chain="" nums="" n=""
+  for chain in PREROUTING POSTROUTING; do
+    nums="$(iptables -t nat -L "$chain" --line-numbers -n 2>/dev/null \
+            | awk '$1 ~ /^[0-9]+$/ && ($2 == "DNAT" || $2 == "MASQUERADE") { print $1 }' \
+            | sort -rn)"
+    for n in $nums; do
+      iptables -t nat -D "$chain" "$n" >/dev/null 2>&1 || true
+    done
   done
 }
 
