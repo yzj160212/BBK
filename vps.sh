@@ -508,20 +508,47 @@ verify_fail2ban() {
     fi
     print_info "  ✓ sshd jail 已加载"
 
-    # 用 TEST-NET-3 保留地址试封，不会影响任何真实用户，测完立刻解封
-    fail2ban-client set sshd banip "$testip" >/dev/null 2>&1
-    sleep 1
-    rule="$(iptables -S 2>/dev/null | grep -m1 'dports')"
-    fail2ban-client set sshd unbanip "$testip" >/dev/null 2>&1
-
-    if printf '%s' "$rule" | grep -q -- "--dports ${ssh_port}"; then
-        print_info "  ✓ 封禁规则指向正确端口 ${ssh_port}"
+    # ① 封禁链是否已经在内核里就位。
+    #    这一步必须在「试封」之前查，因为此刻还没有任何封禁记录 ——
+    #    等价于「机器刚重启完、fail2ban 刚起来」的状态，也就是用户实际会去看的那一刻。
+    #
+    #    ⚠️ 为什么必须单独查：fail2ban ≥0.10（IPv6 支持）对**带条件参数的动作**
+    #    （iptables 系列动作里写了 `[Init?family=inet6]`，就算带条件）
+    #    默认 actionstart_on_demand = true，也就是把 actionstart
+    #    （建 f2b-sshd 链 + 往 INPUT 插 `--dports <端口>` 规则）**推迟到第一次真正封禁**。
+    #    后果：服务 active、jail 已加载、status 一切正常，但 iptables 里既没有
+    #    f2b-sshd 链、也没有任何指向 SSH 端口的规则；重启后封禁列表清空 → 再次消失。
+    #    看起来就是「fail2ban 没在监控我的自定义端口 / 完全没生效」。
+    #    官方讨论：fail2ban/fail2ban#3074（引用 PR #1742）。
+    #    本脚本用 action.d/iptables-multiport.local 关掉了这个行为，这里校验它真的生效。
+    if iptables -S 2>/dev/null | grep -q -- "-j f2b-sshd"; then
+        rule="$(iptables -S 2>/dev/null | grep -m1 -- '--dports')"
+        if printf '%s' "$rule" | grep -q -- "--dports ${ssh_port}"; then
+            print_info "  ✓ 封禁链已就位，指向端口 ${ssh_port}（重启后不会消失）"
+        else
+            print_error "  ✗ 封禁链已就位，但端口不是 ${ssh_port}"
+            print_error "    实际规则：${rule:-（没有 dports 规则）}"
+            print_error "    → 封禁会打到错误端口上，等于没有保护。请检查 jail.local 的 port"
+            ok=0
+        fi
     else
-        print_error "  ✗ 封禁规则没有指向 ${ssh_port}"
-        print_error "    实际规则：${rule:-（未生成）}"
-        print_error "    → 这就是「fail2ban 正常启动但毫无保护」的典型症状，请检查 jail.local 的 port"
+        print_error "  ✗ iptables 里没有 f2b-sshd 规则 —— fail2ban 起来了，却完全没接管防火墙"
+        print_error "    → 检查 /etc/fail2ban/action.d/iptables-multiport.local 是否存在，"
+        print_error "      且 [Definition] 段里有 actionstart_on_demand = false"
         ok=0
     fi
+
+    # ② 真封一次，确认封禁动作能落到内核（不只是配置里写着）。
+    #    用 TEST-NET-3 保留地址，不会影响任何真实用户，测完立刻解封。
+    fail2ban-client set sshd banip "$testip" >/dev/null 2>&1
+    sleep 1
+    if iptables -S f2b-sshd 2>/dev/null | grep -qF -- "-s ${testip}"; then
+        print_info "  ✓ 试封 ${testip} 已落到内核"
+    else
+        print_error "  ✗ 试封 ${testip} 没有产生内核规则"
+        ok=0
+    fi
+    fail2ban-client set sshd unbanip "$testip" >/dev/null 2>&1
 
     # filter 模式检查。
     # 必须显式写成 filter = sshd[mode=aggressive] 或 [mode=ddos]。
@@ -659,6 +686,35 @@ EOF
     #      WARNING 'allowipv6' not defined in 'Definition'. Using default one: 'auto'
     #    （默认值就是 auto，功能上没影响，只是噪音）
     printf '[Definition]\nallowipv6 = auto\n' > /etc/fail2ban/fail2ban.local
+
+    # ------------------------------------------------------------------
+    # 关掉 fail2ban 的「动作按需启动」，让封禁链随服务启动就建好
+    # ------------------------------------------------------------------
+    # ⚠️ 这是「fail2ban 明明在运行、iptables 里却找不到自己端口的规则」的真正原因。
+    #
+    # fail2ban ≥0.10（IPv6 支持）对**带条件参数的动作**（iptables 系列动作的配置里
+    # 写了 `[Init?family=inet6]`，就算带条件）默认 actionstart_on_demand = true，
+    # 即把 actionstart —— 建 f2b-sshd 链 + 往 INPUT 插 `--dports <端口>` 规则 ——
+    # **推迟到「第一次真正封禁」时才执行**。后果：
+    #   · 服务 active、jail 已加载、fail2ban-client status 全部正常；
+    #   · 但 iptables 里既没有 f2b-sshd 链，也没有任何指向 SSH 端口的规则；
+    #   · 重启后封禁列表为空 → 规则再次消失（而脚本结尾恰恰建议重启）。
+    # 看起来就是「fail2ban 没在监控我的自定义端口 / 完全没生效」。
+    # 官方讨论：fail2ban/fail2ban#3074（引用 PR #1742）。
+    #
+    # 修法：用 fail2ban 官方的 action.d/*.local 覆盖机制显式关掉。
+    # 为什么不用在 jail 里写 banaction = iptables-multiport[...]：
+    #   jail.conf 里的 action = %(banaction)s[name=...] 会拼出两个方括号组，解析脆弱；
+    #   而 .local 是官方覆盖机制，包升级也不会被覆盖掉。
+    # 说明：Debian 12 的 banaction 默认就是 iptables-multiport（见 jail.conf），
+    #   本套配置没有改过它，所以这里固定写 iptables-multiport.local。
+    mkdir -p /etc/fail2ban/action.d
+    cat > /etc/fail2ban/action.d/iptables-multiport.local << 'EOF'
+# 由 vps.sh 写入：让封禁链随服务启动就建好，不要拖到第一次封禁才建。
+[Definition]
+actionstart_on_demand = false
+EOF
+    print_info "已关闭 fail2ban 的按需启动（封禁链随服务启动即就位）"
 
     # 验证配置文件
     print_info "验证 fail2ban 配置..."
@@ -1116,18 +1172,25 @@ main() {
 
     # 清理 VPS 商家预装的「伪优化」脚本（重装系统后会再次出现，所以每次开荒都清）
     clean_vendor_presets
+    
+    # 配置防火墙
+    # ⚠️ 必须在 fail2ban 之前：ufw --force reset / ufw enable 会重建 INPUT 链上的
+    #    跳转规则。让 ufw 先跑完，fail2ban 再用 -I INPUT 把封禁规则插到 INPUT 最前面，
+    #    顺序就永远是确定的（封禁规则必须在 ufw 的 ACCEPT 之上，否则被封的 IP
+    #    会先被 ufw 放行，封禁形同虚设）。放在 fail2ban 之后还有第二个坏处：
+    #    fail2ban 自检看到的不是最终状态。
+    configure_firewall "$SSH_PORT"
 
     # 配置 fail2ban
     if configure_fail2ban "$SSH_PORT"; then
         print_info "fail2ban 配置完成"
-        verify_fail2ban "$SSH_PORT"
+        # ⚠️ 必须带 || true：脚本开头是 set -e，自检返回 1 会把整个脚本直接中断，
+        #    后面的日志配置和 SSH 重启都不会执行。
+        verify_fail2ban "$SSH_PORT" || true
     else
         print_warning "fail2ban 配置可能有问题，但脚本继续执行"
     fi
-    
-    # 配置防火墙
-    configure_firewall "$SSH_PORT"
-    
+
     # 配置日志管理（低配置VPS优化）
     configure_logs
     
