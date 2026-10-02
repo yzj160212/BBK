@@ -756,7 +756,11 @@ EOF
     fi
     
     # 启动服务
-    systemctl start fail2ban
+    # ⚠️ 必须用 restart 而不是 start：如果 fail2ban 已经在跑（重跑开荒脚本时的常见情况），
+    #    `systemctl start` 是 no-op —— 新写的配置（尤其是 action.d/*.local）不会被加载，
+    #    修复「文件明明写对了」却完全不生效。真机踩过：进程启动时间早于 .local 写入时间，
+    #    iptables 里始终没有规则；手动 restart 一次才生效。
+    systemctl restart fail2ban
     
     # 等待服务完全启动
     sleep 8
