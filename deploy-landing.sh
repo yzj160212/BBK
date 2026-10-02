@@ -257,6 +257,16 @@ pubkey_parsable() {
   [[ -n "$out" ]]
 }
 
+# 当前会话是否真的能向用户提问。
+# ⚠️ 不能用 [[ -r /dev/tty ]]：/dev/tty 是权限 666 的设备节点，root 下 -r 恒为真 ——
+#    即使当前会话**根本没有控制终端**（`ssh 主机 "命令"` 不带 -t 就是这种）也会判定成
+#    「能问」，然后真正 read 时报 "No such device or address"，上层的 while true 就会
+#    空转到把日志刷爆（实测刷了几万行）。必须实际打开一次才算数。
+tty_usable() {
+    [[ -t 0 ]] && return 0
+    { true < /dev/tty; } 2>/dev/null
+}
+
 # 从终端确认。0=同意，1=不同意或无法询问。
 # 优先读 /dev/tty：`curl ... | bash` 时 stdin 是脚本文本本身，绝不能去读它。
 # 提示语用 printf '%b' 输出：%s 不解析反斜杠转义，带颜色码时会原样显示成乱码。
@@ -266,7 +276,7 @@ ask_confirm() {
   if [[ -t 0 ]]; then
     printf '%b' "$prompt" >&2
     IFS= read -r ans || ans=""
-  elif [[ -r /dev/tty ]]; then
+  elif tty_usable; then
     printf '%b' "$prompt" >&2
     IFS= read -r ans < /dev/tty || ans=""
   else
@@ -352,7 +362,7 @@ run_bootstrap() {
   printf '  密码登录  : 将被禁用（只允许密钥登录）\n'
   hr
   if [[ "$BOOTSTRAP_YES" -ne 1 ]]; then
-    if [[ -t 0 || -r /dev/tty ]]; then
+    if tty_usable; then
       ask_confirm "确认按以上参数开荒？(y/N): " || die "已取消，未做任何改动。"
     else
       die "无法交互确认。请加 --yes 表示你已确认以上参数（无人值守模式）。"

@@ -72,6 +72,16 @@ VPS_RAW="${VPS_RAW:-https://raw.githubusercontent.com/yzj160212/BBK/main}"
 # 留空则不加。可用 --admin-ip 传入，也可用 VPS_ADMIN_IP 环境变量。
 VPS_ADMIN_IP="${VPS_ADMIN_IP:-}"
 
+# 当前会话是否真的能向用户提问。
+# ⚠️ 不能用 [[ -r /dev/tty ]]：/dev/tty 是权限 666 的设备节点，root 下 -r 恒为真 ——
+#    即使当前会话**根本没有控制终端**（`ssh 主机 "命令"` 不带 -t 就是这种）也会判定成
+#    「能问」，然后真正 read 时报 "No such device or address"，上层的 while true 就会
+#    空转到把日志刷爆（实测刷了几万行）。必须实际打开一次才算数。
+vps_tty_usable() {
+    [[ -t 0 ]] && return 0
+    { true < /dev/tty; } 2>/dev/null
+}
+
 # 从终端读一行。
 # 为什么不用裸 read：`curl ... | bash` 时 bash 自己正在从 stdin 读脚本，
 # 如果脚本里的 read 也去读 stdin，会把还没执行的脚本文本吃掉 —— 灾难。
@@ -87,7 +97,7 @@ vps_read_tty() {
     if [[ -t 0 ]]; then
         printf '%b' "$__prompt" >&2
         IFS= read -r __val || __val=""
-    elif [[ -r /dev/tty ]]; then
+    elif vps_tty_usable; then
         printf '%b' "$__prompt" >&2
         IFS= read -r __val < /dev/tty || __val=""
     else
@@ -100,7 +110,7 @@ vps_read_tty() {
 
 # 是否具备「能问用户」的条件
 vps_can_ask() {
-    [[ -t 0 || -r /dev/tty ]]
+    vps_tty_usable
 }
 
 # 确认对话框。--yes 时直接返回 0；无法询问时返回 1（调用方决定默认动作）
